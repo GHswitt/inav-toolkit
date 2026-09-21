@@ -1623,6 +1623,14 @@ class BlackboxDecoder:
             "gyro_roll": ["gyroADC[0]", "gyroData[0]", "gyro[0]"],
             "gyro_pitch": ["gyroADC[1]", "gyroData[1]", "gyro[1]"],
             "gyro_yaw": ["gyroADC[2]", "gyroData[2]", "gyro[2]"],
+            # Unfiltered gyro. INAV logs gyroRaw[] whenever the GYRO_RAW blackbox
+            # field is enabled, precisely so the filter chain can be evaluated by
+            # comparing it against gyroADC[] -- but nothing here mapped it, so every
+            # noise assessment was made on the already-filtered signal. Mapping it
+            # does not change any existing output; it just makes the raw series
+            # available for pre/post-filter comparison.
+            "gyro_raw_roll": ["gyroRaw[0]"], "gyro_raw_pitch": ["gyroRaw[1]"],
+            "gyro_raw_yaw": ["gyroRaw[2]"],
             "setpoint_roll": ["rcCommand[0]", "setpoint[0]"],
             "setpoint_pitch": ["rcCommand[1]", "setpoint[1]"],
             "setpoint_yaw": ["rcCommand[2]", "setpoint[2]"],
