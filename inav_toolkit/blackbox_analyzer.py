@@ -686,8 +686,11 @@ def extract_fc_config(raw_params):
                     pass
 
     # Map numeric filter types to names (INAV logs numeric codes)
-    # INAV: 0=PT1, 1=PT1(alt), 2=BIQUAD, 3=PT2, 4=PT3
-    FILTER_TYPE_NAMES = {0: "PT1", 1: "PT1", 2: "BIQUAD", 3: "PT2", 4: "PT3"}
+    # INAV's filterType_e / lookupTableFilterType is {PT1, BIQUAD, PT2, PT3}.
+    # There is no duplicate "1=PT1(alt)" entry; assuming one shifts PT2/PT3 down
+    # by one, so dterm_lpf_type=PT3 gets reported as PT2.
+    # INAV: 0=PT1, 1=BIQUAD, 2=PT2, 3=PT3
+    FILTER_TYPE_NAMES = {0: "PT1", 1: "BIQUAD", 2: "PT2", 3: "PT3"}
     for ftype_key in ["dterm_lpf_type", "dterm_lpf2_type", "gyro_lowpass_type", "gyro_lowpass2_type"]:
         val = config.get(ftype_key)
         if isinstance(val, (int, float)):
