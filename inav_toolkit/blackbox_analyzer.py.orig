@@ -3832,8 +3832,17 @@ def analyze_baro_quality(data, sr):
     results["noise_cm"] = round(noise_cm, 1)
 
     # ─── Spike detection ───
+    # Count contiguous EXCURSIONS, not samples over threshold. At a 1kHz log rate
+    # np.sum() scores a single 1-second excursion as 1000 "spikes", which turns a
+    # handful of takeoff transients into an alarming four-digit number.
+    # NOTE: `residual` is measured against a 0.5Hz lowpass trend, so any genuine
+    # climb or descent faster than that filter can track also lands here. Treat a
+    # small event count on a dynamic flight as normal.
     threshold = max(noise_cm * 5, 100)  # 5 sigma or 1m, whichever is larger
-    spikes = int(np.sum(np.abs(residual) > threshold))
+    over = np.abs(residual) > threshold
+    spikes = int(np.count_nonzero(np.diff(over.astype(np.int8)) == 1))
+    if over.size and over[0]:
+        spikes += 1  # excursion already in progress at the first sample
     results["spikes"] = spikes
 
     # ─── Throttle correlation ───
@@ -3868,7 +3877,7 @@ def analyze_baro_quality(data, sr):
 
     if spikes > 3:
         score -= 15
-        findings.append(("WARNING", f"{spikes} baro spikes detected - "
+        findings.append(("WARNING", f"{spikes} baro spike events detected - "
                          "may cause altitude jumps in althold"))
 
     corr = results["throttle_correlation"]

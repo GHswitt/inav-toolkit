@@ -2728,14 +2728,28 @@ def detect_hover_oscillation(data, sr, profile=None):
         cause = None
         if severity != "none" and dominant_freq is not None:
             if dominant_freq < 10:
-                # Low-frequency wobble. On large frames (10"+), this is often
-                # wind buffeting or GPS position hold corrections, NOT P oscillation.
+                # Low-frequency wobble is often wind buffeting, pilot input or GPS
+                # position hold corrections, NOT P oscillation.
                 # True P oscillation has a sharp spectral peak (high prominence).
                 # Wind buffeting is broadband (low prominence).
-                if frame_inches >= 10 and peak_prominence < 6:
-                    cause = "wind_buffeting"  # Likely environmental, not tuning
-                elif frame_inches >= 10 and dominant_freq < 3:
-                    cause = "wind_buffeting"  # <3Hz on 10"+ is almost certainly wind
+                #
+                # These two tests used to be gated on `frame_inches >= 10`, which made
+                # the classification a function of frame size rather than of physics:
+                # identical data scored "wind_buffeting" on a 10" frame and
+                # "P_too_high" (a 30% P cut) on a 7". Rotor dynamics do not change at
+                # ten inches, and a multirotor P loop of any size oscillates at
+                # 20-50Hz, not at 1Hz. Measured on a 7" 6S quad, 95% of gyro energy
+                # sat in 0.4-3Hz with 0.60 coherence against the rate setpoint, while
+                # 20-50Hz held 0.06% with 0.07 coherence -- commanded motion and wind,
+                # with no P instability present anywhere.
+                #
+                # The gate is removed; the frequency and prominence tests stand on
+                # their own. A sharp 3-10Hz peak is still attributed to P, which keeps
+                # heavy frames (where the P loop genuinely runs slower) diagnosable.
+                if peak_prominence < 6:
+                    cause = "wind_buffeting"  # broadband => environmental, not tuning
+                elif dominant_freq < 3:
+                    cause = "wind_buffeting"  # <3Hz is not a multirotor P loop
                 else:
                     cause = "P_too_high"
             elif dominant_freq < 25:
