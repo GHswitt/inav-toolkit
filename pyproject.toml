@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "inav-toolkit"
-version = "2.23.0"
+version = "2.23.1"
 description = "Blackbox analyzer, parameter checker, and tuning wizard for INAV flight controllers"
 readme = "README.md"
 license = {text = "GPL-3.0-or-later"}
@@ -35,8 +35,9 @@ dependencies = [
 test = ["pytest>=7.0"]
 
 [project.urls]
-Homepage = "https://github.com/agoliveira/INAV-Toolkit"
-Issues = "https://github.com/agoliveira/INAV-Toolkit/issues"
+Homepage = "https://github.com/GHswitt/inav-toolkit"
+Issues = "https://github.com/GHswitt/inav-toolkit/issues"
+"Original project" = "https://github.com/agoliveira/INAV-Toolkit"
 
 [project.scripts]
 inav-analyze = "inav_toolkit.blackbox_analyzer:main"

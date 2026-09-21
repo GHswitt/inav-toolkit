@@ -1,3 +1,21 @@
+> ## About this repository
+>
+> This is a **continuation of [INAV Toolkit](https://github.com/agoliveira/INAV-Toolkit)
+> by agoliveira**, whose repository is not reachable. The code here starts
+> from the last published release, [inav-toolkit 2.23.0 on PyPI](https://pypi.org/project/inav-toolkit/),
+> imported verbatim as the first commit.
+>
+> **This is a modified version.** Changes made after that import are listed in
+> [CHANGELOG.md](CHANGELOG.md) and are each a separate, self-contained commit with the
+> reasoning and measurements that motivated it. Everything below this box is the original
+> author's README, unchanged.
+>
+> Licensed **GPL-3.0-or-later**, as the original is. All credit for the toolkit itself
+> belongs to agoliveira; the modifications are bug fixes and INAV-compatibility
+> corrections found while using it on a 7" INAV 9.1.0 build.
+
+---
+
 # INAV Toolkit
 
 A Python toolkit for analyzing blackbox logs, validating configurations, and tuning INAV flight controllers. Plug in your FC via USB — it runs a pre-flight safety check, pulls the config, downloads the blackbox, analyzes PID tuning and navigation performance, compares with your previous flight, tells you exactly what to change, and gives you the CLI commands to paste. Every config is archived automatically so you can diff any two sessions.

@@ -1,3 +1,3 @@
 """INAV Toolkit - Blackbox analyzer, parameter checker, and tuning wizard for INAV flight controllers."""
 
-__version__ = "2.23.0"
+__version__ = "2.23.1"
