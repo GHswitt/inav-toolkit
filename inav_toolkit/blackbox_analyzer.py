@@ -6454,7 +6454,7 @@ def print_terminal_report(plan, noise_results, pid_results, motor_analysis, conf
             # GUI hints from active actions (including sub_actions)
             gui_hints = []
             for a in active_actions:
-                if "sub_actions" in a:
+                if a.get("sub_actions"):
                     for sa in a["sub_actions"]:
                         param = sa.get("param", "")
                         if param in INAV_GUI_MAP:
@@ -8377,7 +8377,7 @@ def _generate_whatif_html(config, plan, pid_results, noise_results):
     for a in plan.get("actions", []):
         if a.get("deferred"):
             continue
-        subs = a.get("sub_actions", [])
+        subs = a.get("sub_actions") or []
         for sa in subs:
             param = sa.get("param", "")
             for ax in axes:
