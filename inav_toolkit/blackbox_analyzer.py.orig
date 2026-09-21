@@ -12148,6 +12148,18 @@ def _analyze_single_log(logfile, args, config_raw=None, summary_only=False):
         except:
             pass
 
+    # Publish battery/motor metadata into config NOW, not 350 lines further down.
+    # analyze_power() reads config["_cell_count"] and silently falls back to
+    # round(max_voltage / 4.2) when it is absent. On a pack that is not fully
+    # charged that guess is low (a 6S resting at 23.0V guesses 5), and every
+    # per-cell voltage in the report is then inflated by cells_real/cells_guessed
+    # -- e.g. a healthy 3.69V/cell printed as an impossible 4.45V/cell.
+    # The assignments further below are left in place and are simply idempotent.
+    if detected_cells or getattr(args, "cells", None):
+        config["_cell_count"] = detected_cells or args.cells
+    if getattr(args, "kv", None):
+        config["_motor_kv"] = args.kv
+
     # ── Show comprehensive banner ──
     nav_mode = getattr(args, 'nav', False)  # kept for backward compat, ignored
     if not summary_only:
