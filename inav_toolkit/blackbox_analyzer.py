@@ -715,11 +715,14 @@ def extract_fc_config(raw_params):
             pass
 
     # Map numeric motor protocol to name for DSHOT detection
-    # INAV: 0=PWM, 1=ONESHOT125, 2=ONESHOT42, 3=MULTISHOT, 4=BRUSHED,
-    #        5=DSHOT150, 6=DSHOT300, 7=DSHOT600, 8=DSHOT1200
+    # INAV's lookupTableMotorPwmProtocol has NO ONESHOT42 (that is a Betaflight
+    # entry). Using the Betaflight ordering shifts every DSHOT rate down by one,
+    # so a board actually running DSHOT300 gets reported as DSHOT150.
+    # INAV: 0=STANDARD, 1=ONESHOT125, 2=MULTISHOT, 3=BRUSHED,
+    #        4=DSHOT150, 5=DSHOT300, 6=DSHOT600
     MOTOR_PROTOCOL_NAMES = {
-        0: "PWM", 1: "ONESHOT125", 2: "ONESHOT42", 3: "MULTISHOT",
-        4: "BRUSHED", 5: "DSHOT150", 6: "DSHOT300", 7: "DSHOT600", 8: "DSHOT1200",
+        0: "STANDARD", 1: "ONESHOT125", 2: "MULTISHOT", 3: "BRUSHED",
+        4: "DSHOT150", 5: "DSHOT300", 6: "DSHOT600",
     }
     mp = config.get("motor_protocol")
     if isinstance(mp, (int, float)):
