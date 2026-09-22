@@ -5,6 +5,31 @@ All notable changes to this fork, relative to the verbatim upstream import.
 Format: each entry corresponds to one commit. See `git log` for full reasoning and the
 measurements behind each change.
 
+## [2.23.2] — 2026-09-22
+
+### Fixed
+
+- **CLI dumps were parsed without regard to profiles.** A `dump all` lists every control,
+  mixer and battery profile; flattening them kept control profile 3's defaults for every
+  per-profile key. With `--config`, a board flying P 53 / I 95 / D 40 was reported as
+  P 40 / I 30 / D 23, with a false "STALE DATA — 14 parameters differ" warning. The parser
+  now returns master settings plus the *active* profiles, and three duplicate parsing loops
+  in `blackbox_analyzer` share it.
+
+- **Step response measured against the wrong signal, in the wrong modes.** Overshoot was
+  computed as gyro (°/s) against stick position (`rcCommand`, ±500) — off by `rate / 50`,
+  i.e. 1.4× at rate 70 — and over the whole log, including Angle and nav modes where the
+  stick commands an attitude rather than a rate. It now uses the logged rate setpoint
+  `axisRate[]` and, when a log has ≥ 10 s of Acro, only the Acro segments, identified from
+  `activeFlightModeFlags`. The report prints the flight-mode breakdown and what the step
+  figures were computed against. On the log that exposed it, pitch overshoot went from
+  59 % to 6 % (the pilot saw no pitch problem) and yaw from 37 % to 68 % (the pilot did see
+  yaw overshoot).
+
+- **Per-module version strings.** 2.23.1 bumped `__init__` and `pyproject.toml` but left
+  the hard-coded `VERSION` / `REPORT_VERSION` in six modules at 2.23.0, so the CLI tools
+  still reported 2.23.0 and `test_module_version_consistent` failed. All now agree.
+
 ## [2.23.1] — 2026-09-21
 
 Continuation of `inav-toolkit` 2.23.0 by agoliveira. Eight changes, all found while
