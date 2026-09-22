@@ -101,20 +101,24 @@ SMIX_SOURCES = {
 # INAV aux mode IDs (from src/main/fc/rc_modes.h)
 # These are the mode_id values used in `aux` commands
 INAV_MODE_NAMES = {
+    # permanentId values from INAV 9.1.0 src/main/fc/fc_msp_box.c
     0: "ARM",
     1: "ANGLE",
     2: "HORIZON",
     3: "NAV ALTHOLD",
     5: "HEADING HOLD",
-    10: "NAV POSHOLD",
-    11: "NAV RTH",
+    10: "NAV RTH",
+    11: "NAV POSHOLD",
     12: "MANUAL",
-    13: "NAV WP",
-    28: "NAV LAUNCH",
-    45: "TURTLE",
-    47: "OSD ALT",
-    48: "NAV COURSE HOLD",
-    53: "MULTI FUNCTION",
+    13: "BEEPER",
+    26: "BLACKBOX",
+    28: "NAV WP",
+    36: "NAV LAUNCH",
+    42: "OSD ALT 1",
+    45: "NAV COURSE HOLD",
+    52: "TURTLE",
+    53: "NAV CRUISE",
+    61: "MULTI FUNCTION",
     62: "MIXER PROFILE 2",
     63: "MIXER TRANSITION",
 }

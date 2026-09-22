@@ -862,20 +862,43 @@ class TestReplay:
 
         sr = 500.0
         n = 5000
+        # Values as INAV 9.1 logs them (taken from a real flight): flightModeFlags
+        # is the switch mask (boxId_e), activeFlightModeFlags the modes in effect
+        # (flightModeFlags_e). PosHold implies Angle and AltHold in the latter.
         data = {
             "time_s": np.arange(n) / sr,
             "n_rows": n, "sample_rate": sr,
             "_slow_frames": [
-                (0, {"flightModeFlags": 1}),      # ARM only
-                (1000, {"flightModeFlags": 3}),    # ARM + ANGLE
-                (3000, {"flightModeFlags": 259}),  # ARM + ANGLE + NAV POSHOLD (bit 8)
+                (0, {"flightModeFlags": 1, "activeFlightModeFlags": 0}),        # armed, Acro
+                (1000, {"flightModeFlags": 11, "activeFlightModeFlags": 9}),    # Angle+AltHold
+                (3000, {"flightModeFlags": 513, "activeFlightModeFlags": 41}),  # PosHold (box 9)
             ],
         }
         modes = _extract_flight_modes(data, sr)
         assert len(modes) == 3
-        assert "ARM" in modes[0]["label"]
-        assert "ANGLE" in modes[1]["label"]
+        assert "ARM" in modes[0]["label"] and "ACRO" in modes[0]["label"]
+        assert "ANGLE" in modes[1]["label"] and "NAV ALTHOLD" in modes[1]["label"]
         assert "NAV POSHOLD" in modes[2]["label"]
+        assert "MANUAL" not in modes[2]["label"]
+
+    def test_replay_flight_modes_switch_mask_fallback(self):
+        """Logs without activeFlightModeFlags fall back to the switch mask,
+        numbered by boxId_e: RTH is box 8, PosHold box 9 (BOXCAMSTAB is 7)."""
+        from inav_toolkit.blackbox_analyzer import _extract_flight_modes
+
+        sr = 500.0
+        n = 3000
+        data = {
+            "time_s": np.arange(n) / sr,
+            "n_rows": n, "sample_rate": sr,
+            "_slow_frames": [
+                (0, {"flightModeFlags": 1 | (1 << 9)}),     # ARM + NAV POSHOLD box
+                (1500, {"flightModeFlags": 1 | (1 << 8)}),  # ARM + NAV RTH box
+            ],
+        }
+        modes = _extract_flight_modes(data, sr)
+        assert "NAV POSHOLD" in modes[0]["label"]
+        assert "NAV RTH" in modes[1]["label"]
 
 
 

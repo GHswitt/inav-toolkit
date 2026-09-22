@@ -22,7 +22,7 @@ except ImportError:
     def t(key, **kw):
         return key.format(**kw) if kw else key
 
-FMODE_FAILSAFE = 1 << 9
+FMODE_FAILSAFE = 1 << 9   # FAILSAFE_MODE in flightModeFlags_e (activeFlightModeFlags)
 
 # Canonical data-dict key → original blackbox column name.
 # Used by the anonymizer so its CSV output round-trips through
@@ -449,7 +449,10 @@ def analyze_postmortem(data, sr, config=None, window_s=10.0):
             ev.append(f"RC inputs frozen for the last {half / sr:.1f}s after prior activity")
     for idx, fields in data.get("_slow_frames", []):
         if idx >= s:
-            flags = fields.get("flightModeFlags")
+            # FAILSAFE_MODE lives in activeFlightModeFlags (flightModeFlags_e).
+            # `flightModeFlags` is the switch mask, where bit 9 is NAV POSHOLD --
+            # reading it here turned every PosHold selection into "RX loss".
+            flags = fields.get("activeFlightModeFlags")
             try:
                 if flags is not None and int(flags) & FMODE_FAILSAFE:
                     ev.append(f"FAILSAFE flag active at t={idx / sr:.1f}s")

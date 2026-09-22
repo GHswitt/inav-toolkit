@@ -2807,18 +2807,76 @@ def detect_hover_oscillation(data, sr, profile=None):
 # different numbering. Bits 0, 3 and 5 verified against a real log: PosHold shows
 # 0|3|5 (it implies Angle and AltHold), Angle+AltHold shows 0|3, Acro shows 0.
 FM_ANGLE, FM_HORIZON, FM_NAV_ALTHOLD, FM_NAV_RTH, FM_NAV_POSHOLD = 0, 1, 3, 4, 5
+FM_NAV_LAUNCH, FM_MANUAL, FM_FAILSAFE, FM_NAV_WP, FM_NAV_COURSE_HOLD = 7, 8, 9, 11, 12
 FM_SELF_LEVEL_MASK = (1 << FM_ANGLE) | (1 << FM_HORIZON)
+
+# Names for every flightModeFlags_e bit, from INAV 9.1.0 runtime_config.h.
+FLIGHT_MODE_NAMES = {
+    0: "ANGLE", 1: "HORIZON", 2: "HEADING", 3: "NAV ALTHOLD", 4: "NAV RTH",
+    5: "NAV POSHOLD", 6: "HEADFREE", 7: "NAV LAUNCH", 8: "MANUAL", 9: "FAILSAFE",
+    10: "AUTOTUNE", 11: "NAV WP", 12: "NAV COURSE HOLD", 13: "FLAPERON",
+    14: "TURN ASSIST", 15: "TURTLE", 16: "SOARING", 17: "ANGLE HOLD",
+    18: "NAV FW AUTOLAND", 19: "NAV SEND TO",
+}
+
+# The S-frame field `flightModeFlags` is a different thing: blackbox.c fills it
+# from rcModeActivationMask -- which *switch* boxes are selected -- numbered by
+# boxId_e (INAV 9.1.0 rc_modes.h: ARM 0, ANGLE 1, HORIZON 2, NAV ALTHOLD 3,
+# HEADING HOLD 4, HEADFREE 5, HEADADJ 6, CAMSTAB 7, NAV RTH 8, NAV POSHOLD 9,
+# MANUAL 10, BEEPER 11, ...). It cannot show a failsafe-triggered RTH, because
+# no switch is involved. It is used here only for the arm switch, and as a
+# fallback for logs that predate activeFlightModeFlags.
+BOX_ARM = 0
+_BOX_TO_FM = {1: FM_ANGLE, 2: FM_HORIZON, 3: FM_NAV_ALTHOLD, 8: FM_NAV_RTH,
+              9: FM_NAV_POSHOLD, 10: FM_MANUAL, 18: FM_FAILSAFE, 19: FM_NAV_WP}
+
+
+def slow_frame_mode_flags(fields):
+    """Flight modes in effect for one slow frame, as flightModeFlags_e bits.
+
+    Uses activeFlightModeFlags; falls back to translating the switch mask for
+    older logs that lack it. Returns None when neither field is present."""
+    val = fields.get("activeFlightModeFlags")
+    if val is not None:
+        try:
+            return int(val)
+        except (ValueError, TypeError):
+            return None
+    val = fields.get("flightModeFlags")
+    if val is None:
+        return None
+    try:
+        box = int(val)
+    except (ValueError, TypeError):
+        return None
+    out = 0
+    for box_bit, fm_bit in _BOX_TO_FM.items():
+        if box & (1 << box_bit):
+            out |= 1 << fm_bit
+    return out
+
+
+def slow_frame_armed(fields):
+    """Arm switch position (BOXARM in the switch mask), or None if not logged."""
+    val = fields.get("flightModeFlags")
+    if val is None:
+        return None
+    try:
+        return bool(int(val) & (1 << BOX_ARM))
+    except (ValueError, TypeError):
+        return None
 
 
 def _active_mode_series(slow_frames, n_rows):
-    """Forward-fill `activeFlightModeFlags` from slow frames onto the main frame
-    timeline. Returns an int array, or None when the log carries no mode data."""
+    """Forward-fill the flight modes in effect (flightModeFlags_e bits) from slow
+    frames onto the main frame timeline. Returns an int array, or None when the
+    log carries no mode data."""
     if not slow_frames or n_rows <= 0:
         return None
     out = np.zeros(n_rows, dtype=np.int64)
     seen = False
     for i, (idx, fields) in enumerate(slow_frames):
-        val = fields.get("activeFlightModeFlags")
+        val = slow_frame_mode_flags(fields)
         if val is None:
             continue
         seen = True
@@ -4268,49 +4326,27 @@ def analyze_estimator_health(data, sr):
 # ─── Nav Controller Performance Analysis ─────────────────────────────────────
 
 def _get_nav_mode_mask(data, sr, mode_bit):
-    """Build a boolean mask at I-frame rate for a specific nav mode.
-
-    Uses slow frame flight mode flags to determine when a mode was active.
+    """Boolean mask at I-frame rate: True where flight mode `mode_bit`
+    (a flightModeFlags_e bit such as NAV_MODE_POSHOLD) was in effect.
     Returns np.ndarray of bools with same length as data arrays.
     """
-    slow_frames = data.get("_slow_frames", [])
     n_rows = data.get("n_rows", len(data.get("time_s", [])))
-    mask = np.zeros(n_rows, dtype=bool)
-
-    if not slow_frames:
-        return mask
-
-    # Build transitions from slow frames
-    transitions = []
-    for frame_idx, fields in slow_frames:
-        mode_flags = fields.get("flightModeFlags", None)
-        if mode_flags is None:
-            for k in fields:
-                if "flight" in k.lower() and "mode" in k.lower():
-                    mode_flags = fields[k]
-                    break
-        if mode_flags is not None:
-            try:
-                flags = int(mode_flags)
-                active = bool(flags & (1 << mode_bit))
-                transitions.append((min(frame_idx, n_rows - 1), active))
-            except (ValueError, TypeError):
-                pass
-
-    # Fill mask between transitions
-    for i, (idx, active) in enumerate(transitions):
-        next_idx = transitions[i + 1][0] if i + 1 < len(transitions) else n_rows
-        if active:
-            mask[idx:next_idx] = True
-
-    return mask
+    modes = data.get("active_modes")
+    if modes is None or len(modes) != n_rows:
+        modes = _active_mode_series(data.get("_slow_frames", []), n_rows)
+    if modes is None:
+        return np.zeros(n_rows, dtype=bool)
+    return (modes & (1 << mode_bit)) != 0
 
 
-# INAV flight mode bits (from src/main/fc/runtime_config.h)
-NAV_MODE_ALTHOLD = 3
-NAV_MODE_RTH = 7
-NAV_MODE_POSHOLD = 8
-NAV_MODE_CRUISE = 28
+# Nav mode bits in flightModeFlags_e (activeFlightModeFlags). These used to be
+# switch-mask positions with BOXCAMSTAB missing (RTH=7, POSHOLD=8, CRUISE=28 --
+# which is BOXAUTOTUNE), so PosHold was never found and "RTH" read the
+# camera-stab box. Cruise has no bit of its own: it is course hold + althold.
+NAV_MODE_ALTHOLD = FM_NAV_ALTHOLD
+NAV_MODE_RTH = FM_NAV_RTH
+NAV_MODE_POSHOLD = FM_NAV_POSHOLD
+NAV_MODE_CRUISE = FM_NAV_COURSE_HOLD
 
 
 def analyze_nav_performance(data, sr, config=None, profile=None):
@@ -4351,8 +4387,9 @@ def analyze_nav_performance(data, sr, config=None, profile=None):
 
     # Get nav mode masks
     poshold_mask = _get_nav_mode_mask(data, sr, NAV_MODE_POSHOLD)
-    althold_mask = _get_nav_mode_mask(data, sr, NAV_MODE_ALTHOLD) | poshold_mask
     rth_mask = _get_nav_mode_mask(data, sr, NAV_MODE_RTH)
+    # Active flags set ALTHOLD alongside POSHOLD; keep RTH separate as before
+    althold_mask = (_get_nav_mode_mask(data, sr, NAV_MODE_ALTHOLD) | poshold_mask) & ~rth_mask
     any_nav_mask = poshold_mask | althold_mask | rth_mask
 
     score = 100
@@ -5904,27 +5941,17 @@ def analyze_failsafe_events(data, sr):
     if not slow_frames:
         return results
 
-    # INAV failsafe shows as specific flight mode bits or flags
-    # flightModeFlags bit 7 = NAV_RTH, we also look for failsafe-specific flags
-    MODE_RTH = 7
-    MODE_ARM = 0
-
-    # Track mode transitions to find failsafe patterns
+    # Modes in effect (flightModeFlags_e): NAV_RTH and FAILSAFE are real bits
+    # there, so a failsafe-triggered RTH is visible without any switch change.
     transitions = []
     for frame_idx, fields in slow_frames:
-        mode_flags = fields.get("flightModeFlags")
-        if mode_flags is None:
-            for k in fields:
-                if "flight" in k.lower() and "mode" in k.lower():
-                    mode_flags = fields[k]
-                    break
-        if mode_flags is not None:
-            try:
-                flags = int(mode_flags)
-                t_s = frame_idx / sr if sr > 0 else 0
-                transitions.append({"time_s": t_s, "flags": flags, "idx": frame_idx})
-            except (ValueError, TypeError):
-                pass
+        flags = slow_frame_mode_flags(fields)
+        if flags is None:
+            continue
+        armed = slow_frame_armed(fields)
+        t_s = frame_idx / sr if sr > 0 else 0
+        transitions.append({"time_s": t_s, "flags": flags, "idx": frame_idx,
+                            "armed": True if armed is None else armed})
 
     # Look for failsafe flags in event frames
     event_frames = data.get("_event_frames", [])
@@ -5945,20 +5972,18 @@ def analyze_failsafe_events(data, sr):
     events = []
     in_rth = False
     rth_start = None
+    is_failsafe = False
 
     for i, tr in enumerate(transitions):
-        is_rth = bool(tr["flags"] & (1 << MODE_RTH))
-        is_armed = bool(tr["flags"] & (1 << MODE_ARM))
+        is_rth = bool(tr["flags"] & (1 << FM_NAV_RTH))
+        is_armed = tr["armed"]
 
         if is_rth and not in_rth:
             # RTH just started
             in_rth = True
             rth_start = tr["time_s"]
-
-            # Check if this looks like failsafe (sudden, no user input pattern)
-            # Simple heuristic: if there's no RC data change near this point
-            # it's likely automatic
-            is_failsafe = False  # would need RC data correlation for accurate detection
+            # FAILSAFE_MODE is set by the failsafe handler itself
+            is_failsafe = bool(tr["flags"] & (1 << FM_FAILSAFE))
 
         elif not is_rth and in_rth:
             # RTH ended
@@ -5970,6 +5995,7 @@ def analyze_failsafe_events(data, sr):
                     "end_s": tr["time_s"],
                     "duration_s": duration,
                     "type": "RTH",
+                    "failsafe": is_failsafe,
                     "recovered": True,
                 })
 
@@ -5982,6 +6008,7 @@ def analyze_failsafe_events(data, sr):
                     "end_s": tr["time_s"],
                     "duration_s": tr["time_s"] - rth_start,
                     "type": "RTH_LANDING",
+                    "failsafe": is_failsafe,
                     "recovered": True,
                 })
 
@@ -8251,40 +8278,27 @@ def _generate_map_html(data, nav_perf=None):
     slow_frames = data.get("_slow_frames", [])
     mode_transitions = []
     for frame_idx, fields in slow_frames:
-        mode_flags = fields.get("flightModeFlags")
-        if mode_flags is None:
-            for k in fields:
-                if "flight" in k.lower() and "mode" in k.lower():
-                    mode_flags = fields[k]
-                    break
-        if mode_flags is not None:
-            try:
-                flags = int(mode_flags)
-                mode_transitions.append((frame_idx, flags))
-            except (ValueError, TypeError):
-                pass
-
-    # Assign mode to each GPS point
-    MODE_POSHOLD = 8
-    MODE_RTH = 7
-    MODE_ALTHOLD = 3
-    MODE_ARM = 0
+        flags = slow_frame_mode_flags(fields)
+        if flags is None:
+            continue
+        armed = slow_frame_armed(fields)
+        mode_transitions.append((frame_idx, flags, True if armed is None else armed))
 
     def get_mode_at(idx):
         """Get flight mode name at a frame index."""
-        flags = 0
-        for fi, fl in mode_transitions:
+        flags, armed = 0, False
+        for fi, fl, arm in mode_transitions:
             if fi <= idx:
-                flags = fl
+                flags, armed = fl, arm
             else:
                 break
-        if flags & (1 << MODE_RTH):
+        if flags & (1 << FM_NAV_RTH):
             return "rth"
-        if flags & (1 << MODE_POSHOLD):
+        if flags & (1 << FM_NAV_POSHOLD):
             return "poshold"
-        if flags & (1 << MODE_ALTHOLD):
+        if flags & (1 << FM_NAV_ALTHOLD):
             return "althold"
-        if flags & (1 << MODE_ARM):
+        if armed:
             return "manual"
         return "disarmed"
 
@@ -11808,40 +11822,22 @@ def _extract_flight_modes(data, sr):
     if not slow_frames:
         return []
 
-    # INAV flight mode IDs (from src/main/fc/runtime_config.h)
-    MODE_NAMES = {
-        0: "ARM", 1: "ANGLE", 2: "HORIZON", 3: "NAV ALTHOLD",
-        4: "HEADING HOLD", 5: "HEADFREE", 6: "HEAD ADJ",
-        7: "NAV RTH", 8: "NAV POSHOLD", 9: "MANUAL",
-        10: "BEEPER", 11: "NAV LAUNCH",
-        12: "OSD SW", 28: "NAV CRUISE",
-        29: "NAV COURSE HOLD", 45: "ANGLE HOLD",
-    }
-
+    # Names come from FLIGHT_MODE_NAMES (flightModeFlags_e, the modes in effect).
+    # The previous table decoded the switch mask with BOXCAMSTAB missing, so every
+    # mode from bit 7 up was mislabelled -- NAV POSHOLD showed as "MANUAL".
     n_rows = data.get("n_rows", len(data.get("time_s", [])))
     transitions = []
 
     for frame_idx, fields in slow_frames:
-        # Look for flightModeFlags in the slow frame
-        mode_flags = fields.get("flightModeFlags", None)
-        if mode_flags is None:
-            # Try alternative field names
-            for k in fields:
-                if "flight" in k.lower() and "mode" in k.lower():
-                    mode_flags = fields[k]
-                    break
-
-        if mode_flags is not None:
-            # Decode bitmask
-            try:
-                flags = int(mode_flags)
-            except (ValueError, TypeError):
-                continue
-
-            active_modes = []
-            for bit, name in MODE_NAMES.items():
-                if flags & (1 << bit):
-                    active_modes.append(name)
+        flags = slow_frame_mode_flags(fields)
+        if flags is not None:
+            armed = slow_frame_armed(fields)
+            active_modes = ["ARM"] if armed else []
+            active_modes += [name for bit, name in FLIGHT_MODE_NAMES.items()
+                             if flags & (1 << bit)]
+            # Rate mode has no bit of its own: armed, not self-levelling, not manual
+            if armed and not flags & (FM_SELF_LEVEL_MASK | (1 << FM_MANUAL)):
+                active_modes.append("ACRO")
 
             t_s = frame_idx / sr if sr > 0 else 0
             if frame_idx < n_rows:
