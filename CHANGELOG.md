@@ -5,6 +5,23 @@ All notable changes to this fork, relative to the verbatim upstream import.
 Format: each entry corresponds to one commit. See `git log` for full reasoning and the
 measurements behind each change.
 
+## [2.23.3] — 2026-09-22
+
+### Fixed
+
+- **Flight modes were decoded from the wrong field with the wrong bit layout.** INAV
+  logs two slow-frame mode fields: `flightModeFlags` is the *switch* mask (`boxId_e`),
+  `activeFlightModeFlags` the modes in effect (`flightModeFlags_e`). Everything read the
+  switch mask through tables missing `BOXCAMSTAB`, so from bit 7 up each mode was one
+  position off. Consequences: PosHold nav analysis never ran (its mask was always empty),
+  PosHold was labelled "MANUAL" in the mode overlay and flight map, failsafe RTH detection
+  read the camera-stab box, and the crash postmortem reported **RX loss for every PosHold
+  selection** (switch bit 9 is PosHold, not failsafe). All consumers now use
+  `activeFlightModeFlags`, with the switch mask kept for the arm switch and as a fallback
+  for older logs. Verified against INAV 9.1.0 source and a real log.
+- `vtol_configurator.INAV_MODE_NAMES` (aux permanent IDs) corrected — RTH/PosHold were
+  swapped, among others. Unreferenced, so no behaviour change.
+
 ## [2.23.2] — 2026-09-22
 
 ### Fixed
