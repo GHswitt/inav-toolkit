@@ -648,25 +648,56 @@ def _generate_diff_verdict(diff):
     return f"Score {direction} by {abs(delta):.0f} points. {'; '.join(parts)}."
 
 
+_PROFILE_SELECTORS = ("control_profile", "profile", "mixer_profile", "battery_profile")
+
+
 def parse_diff_output(diff_text):
-    """Parse INAV CLI 'diff all' output into key-value dict.
+    """Parse INAV CLI 'diff all' / 'dump all' output into the settings the FC
+    is actually running.
 
     Handles lines like:
         set gyro_main_lpf_hz = 40
         set mc_p_roll = 32
+        control_profile 2
         # master
         # profile
+
+    A `dump all` -- and a `diff all` whenever a non-active profile holds
+    non-default values -- contains every control, mixer and battery profile,
+    each introduced by a selector line such as `control_profile 2`, and ends
+    with a `# restore original profile selection` block that re-selects the
+    active ones. Flattening everything into one dict kept the *last* profile's
+    value for every per-profile key, i.e. control profile 3's defaults, so a
+    board flying P=53 was reported as P=40 and a false "config changed since
+    this flight" warning followed.
+
+    Returns master (global) settings overlaid with the active profile of each
+    type. The active profile is the last selector seen for that type, which is
+    what the restore block of every CLI dump/diff provides. Settings outside
+    any profile section are treated as global.
     """
     config = {}
     if not diff_text:
         return config
+    master = {}
+    profiles = {}   # (type, number) -> {param: value}
+    active = {}     # type -> number
+    current = None  # None = master section
     for line in diff_text.splitlines():
         line = line.strip()
+        tok = line.split()
+        if len(tok) == 2 and tok[0] in _PROFILE_SELECTORS and tok[1].isdigit():
+            ptype = "control_profile" if tok[0] == "profile" else tok[0]
+            current = (ptype, int(tok[1]))
+            active[ptype] = current[1]
+            continue
         if line.startswith("set ") and " = " in line:
             # "set param_name = value"
             parts = line[4:].split(" = ", 1)
             if len(parts) == 2:
-                param = parts[0].strip()
-                value = parts[1].strip()
-                config[param] = value
+                target = master if current is None else profiles.setdefault(current, {})
+                target[parts[0].strip()] = parts[1].strip()
+    config.update(master)
+    for ptype, num in active.items():
+        config.update(profiles.get((ptype, num), {}))
     return config

@@ -760,6 +760,12 @@ CLI_TO_CONFIG = {
 
     # Gyro filters
     "gyro_main_lpf_hz": "gyro_lowpass_hz",
+    # INAV 9.x dynamic gyro lowpass. None of these exist as blackbox header fields,
+    # so they can only ever arrive via --config. Without them the analyzer models a
+    # static PT1 at gyro_main_lpf_hz that is not actually running.
+    "gyro_filter_mode": "gyro_filter_mode",
+    "gyro_dyn_lpf_min_hz": "gyro_dyn_lpf_min_hz",
+    "gyro_dyn_lpf_max_hz": "gyro_dyn_lpf_max_hz",
     "gyro_main_lpf_type": "gyro_lowpass_type",
     "gyro_main_lpf2_hz": "gyro_lowpass2_hz",
 
@@ -851,6 +857,7 @@ CLI_INT_KEYS = {
     "pitch_p", "pitch_i", "pitch_d", "pitch_ff",
     "yaw_p", "yaw_i", "yaw_d", "yaw_ff",
     "gyro_lowpass_hz", "gyro_lowpass2_hz",
+    "gyro_dyn_lpf_min_hz", "gyro_dyn_lpf_max_hz",
     "dterm_lpf_hz", "dterm_lpf2_hz",
     "dyn_notch_q", "dyn_notch_min_hz", "dyn_notch_count",
     "rpm_filter_harmonics", "rpm_filter_min_hz", "rpm_filter_q",
@@ -5157,6 +5164,24 @@ def generate_action_plan(noise_results, pid_results, motor_analysis, dterm_resul
     current_gyro_lp = config.get("gyro_lowpass_hz") if has_filters else None
     rec_gyro_lp = compute_recommended_filter(noise_results, current_gyro_lp, "gyro", profile)
 
+    # When gyro_filter_mode is DYNAMIC the static gyro_main_lpf_hz is ignored by the
+    # FC -- the gyro lowpass sweeps gyro_dyn_lpf_min_hz..max_hz with throttle. The
+    # blackbox header cannot express the mode or the range, so config["gyro_lowpass_hz"]
+    # holds the inert static value and any "change gyro_main_lpf_hz" action would be a
+    # no-op on the aircraft. Report the equivalent cutoff as information instead, so the
+    # analysis is still useful without emitting a setting that does nothing.
+    if rec_gyro_lp is not None and str(config.get("gyro_filter_mode", "")).upper() == "DYNAMIC":
+        dyn_lo = config.get("gyro_dyn_lpf_min_hz")
+        dyn_hi = config.get("gyro_dyn_lpf_max_hz")
+        rng = f"{dyn_lo}-{dyn_hi}Hz" if dyn_lo and dyn_hi else "its configured range"
+        info_items.append({
+            "text": f"Gyro lowpass is DYNAMIC ({rng}) - gyro_main_lpf_hz is inactive",
+            "detail": f"Noise analysis suggests an equivalent static cutoff near "
+                      f"{rec_gyro_lp}Hz. Compare that against the sweep and adjust "
+                      f"gyro_dyn_lpf_min_hz / gyro_dyn_lpf_max_hz if needed -- setting "
+                      f"gyro_main_lpf_hz would have no effect while the mode is DYNAMIC."})
+        rec_gyro_lp = None
+
     if rec_gyro_lp is not None:
         worst_noise = max((nr["rms_high"] for nr in noise_results if nr), default=-80)
         if worst_noise > bad_noise:
@@ -5642,6 +5667,19 @@ def generate_tuning_recipe(noise_results, noise_fp, config, profile, accel_vib=N
 
     if has_structural:
         reasoning.append("Structural vibration detected — check frame hardware, soft-mount FC")
+
+    # Same DYNAMIC caveat as the action list: gyro_main_lpf_hz is inert while
+    # gyro_filter_mode is DYNAMIC, and this block is paste-ready, so emitting it would
+    # hand the pilot a command that silently does nothing on the aircraft.
+    if str(config.get("gyro_filter_mode", "")).upper() == "DYNAMIC" and "gyro_main_lpf_hz" in stack:
+        inert = stack.pop("gyro_main_lpf_hz")
+        dyn_lo = config.get("gyro_dyn_lpf_min_hz")
+        dyn_hi = config.get("gyro_dyn_lpf_max_hz")
+        rng = f"{dyn_lo}-{dyn_hi}Hz" if dyn_lo and dyn_hi else "its configured range"
+        reasoning.append(
+            f"Gyro lowpass is DYNAMIC ({rng}) — gyro_main_lpf_hz omitted from the stack, "
+            f"it is inert. Equivalent static cutoff would be {inert}Hz; adjust "
+            f"gyro_dyn_lpf_min_hz / gyro_dyn_lpf_max_hz instead.")
 
     # Generate CLI
     cli_commands = [f"set {k} = {v}" for k, v in stack.items()]

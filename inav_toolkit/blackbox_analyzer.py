@@ -9571,6 +9571,19 @@ _FIELDS_NAV_SLOW = {
 }
 
 
+def _cli_settings(text):
+    """Active-profile settings from CLI dump/diff text.
+
+    Thin wrapper so every reader of a CLI dump shares flight_db's
+    profile-aware parser instead of flattening all profiles together.
+    """
+    try:
+        from inav_toolkit.flight_db import parse_diff_output
+    except ImportError:
+        from inav_flight_db import parse_diff_output
+    return parse_diff_output(text)
+
+
 def check_blackbox_readiness_from_dump(config_text):
     """Check blackbox configuration from FC dump/diff output (pre-download).
 
@@ -9605,6 +9618,9 @@ def check_blackbox_readiness_from_dump(config_text):
             m = re.match(r"set\s+(\S+)\s*=\s*(.*)", line)
             if m:
                 settings[m.group(1).strip()] = m.group(2).strip()
+
+    # Per-profile keys must come from the active profile, not the last one listed
+    settings = _cli_settings(config_text)
 
     # Check blackbox feature
     has_blackbox = "BLACKBOX" in features
@@ -9683,6 +9699,9 @@ def preflight_checklist(config_text, frame_inches=None):
             m = re.match(r"set\s+(\S+)\s*=\s*(.*)", line)
             if m:
                 settings[m.group(1).strip()] = m.group(2).strip()
+
+    # Per-profile keys must come from the active profile, not the last one listed
+    settings = _cli_settings(config_text)
 
     # ═══ CRITICAL: Safety beepers ═══
     critical_beepers = ["BAT_CRIT_LOW", "BAT_LOW", "RX_LOST", "RX_LOST_LANDING", "HW_FAILURE"]
@@ -10033,18 +10052,12 @@ def vault_diff(path_a, path_b):
         unchanged (int): count of identical settings
     """
     def parse_settings(path):
-        settings = {}
+        # Active-profile view, so two dumps compare what each FC actually ran
         try:
             with open(path, "r") as f:
-                for line in f:
-                    line = line.strip()
-                    if line.startswith("set ") and " = " in line:
-                        parts = line[4:].split(" = ", 1)
-                        if len(parts) == 2:
-                            settings[parts[0].strip()] = parts[1].strip()
+                return _cli_settings(f.read())
         except Exception:
-            pass
-        return settings
+            return {}
 
     a = parse_settings(path_a)
     b = parse_settings(path_b)
