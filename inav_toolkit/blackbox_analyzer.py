@@ -1641,6 +1641,12 @@ class BlackboxDecoder:
             "setpoint_roll": ["rcCommand[0]", "setpoint[0]"],
             "setpoint_pitch": ["rcCommand[1]", "setpoint[1]"],
             "setpoint_yaw": ["rcCommand[2]", "setpoint[2]"],
+            # The rate setpoint the PID controller actually tracks, in deg/s, in every
+            # flight mode. rcCommand above is stick position (+-500); in Acro INAV turns
+            # it into a rate as rcCommand * rate / 50, and in Angle/nav modes the rate
+            # comes from the attitude controller instead, so rcCommand is not a setpoint.
+            "rate_sp_roll": ["axisRate[0]"], "rate_sp_pitch": ["axisRate[1]"],
+            "rate_sp_yaw": ["axisRate[2]"],
             "axisP_roll": ["axisP[0]"], "axisP_pitch": ["axisP[1]"], "axisP_yaw": ["axisP[2]"],
             "axisI_roll": ["axisI[0]"], "axisI_pitch": ["axisI[1]"], "axisI_yaw": ["axisI[2]"],
             "axisD_roll": ["axisD[0]"], "axisD_pitch": ["axisD[1]"], "axisD_yaw": ["axisD[2]"],
@@ -1757,6 +1763,7 @@ def decode_blackbox_native(filepath, raw_params, quiet=False):
     data["_slow_frames"] = decoder.slow_frames    # [(frame_idx, {field: value})]
     data["_gps_frames"] = decoder.gps_frames      # [(frame_idx, {field: value})]
     data["_decoder_stats"] = decoder.stats         # {i_frames, p_frames, errors, ...}
+    data["active_modes"] = _active_mode_series(decoder.slow_frames, len(data.get("time_s", [])))
 
     # Detect available nav fields for downstream analysis
     nav_fields = [k for k in data if k.startswith("nav_") or k.startswith("att_") or k == "baro_alt"]
@@ -2794,13 +2801,94 @@ def detect_hover_oscillation(data, sr, profile=None):
     return results
 
 
+# INAV flightModeFlags_e (src/main/fc/runtime_config.h): the modes actually in
+# effect, logged in S-frames as `activeFlightModeFlags`. Not to be confused with
+# the S-frame field `flightModeFlags`, which is the *switch* (box) mask and uses a
+# different numbering. Bits 0, 3 and 5 verified against a real log: PosHold shows
+# 0|3|5 (it implies Angle and AltHold), Angle+AltHold shows 0|3, Acro shows 0.
+FM_ANGLE, FM_HORIZON, FM_NAV_ALTHOLD, FM_NAV_RTH, FM_NAV_POSHOLD = 0, 1, 3, 4, 5
+FM_SELF_LEVEL_MASK = (1 << FM_ANGLE) | (1 << FM_HORIZON)
+
+
+def _active_mode_series(slow_frames, n_rows):
+    """Forward-fill `activeFlightModeFlags` from slow frames onto the main frame
+    timeline. Returns an int array, or None when the log carries no mode data."""
+    if not slow_frames or n_rows <= 0:
+        return None
+    out = np.zeros(n_rows, dtype=np.int64)
+    seen = False
+    for i, (idx, fields) in enumerate(slow_frames):
+        val = fields.get("activeFlightModeFlags")
+        if val is None:
+            continue
+        seen = True
+        start = min(max(int(idx), 0), n_rows)
+        end = slow_frames[i + 1][0] if i + 1 < len(slow_frames) else n_rows
+        out[start:min(int(end), n_rows)] = int(val)
+    return out if seen else None
+
+
+def rate_mode_mask(data):
+    """True where the craft is in a rate (Acro) mode: neither Angle nor Horizon.
+
+    Every multirotor nav mode (AltHold, PosHold, RTH, WP) forces Angle, so this
+    also excludes them. Returns None when the log has no flight-mode data."""
+    modes = data.get("active_modes")
+    if modes is None:
+        return None
+    return (modes & FM_SELF_LEVEL_MASK) == 0
+
+
+def flight_mode_breakdown(data, sr):
+    """Seconds spent in Acro / Angle / AltHold / PosHold / RTH, for reporting."""
+    modes = data.get("active_modes")
+    if modes is None:
+        return None
+    angle = (modes & FM_SELF_LEVEL_MASK) != 0
+    alt = (modes & (1 << FM_NAV_ALTHOLD)) != 0
+    pos = (modes & (1 << FM_NAV_POSHOLD)) != 0
+    rth = (modes & (1 << FM_NAV_RTH)) != 0
+    return {"acro": float(np.sum(~angle)) / sr,
+            "angle": float(np.sum(angle & ~alt & ~pos & ~rth)) / sr,
+            "althold": float(np.sum(alt & ~pos & ~rth)) / sr,
+            "poshold": float(np.sum(pos & ~rth)) / sr,
+            "rth": float(np.sum(rth)) / sr}
+
+
+# Below this much Acro time, fall back to the whole log rather than report
+# step statistics from a handful of stick movements.
+MIN_ACRO_SECONDS_FOR_STEPS = 10.0
+
+
 def analyze_pid_response(data, axis_idx, sr):
     axis = AXIS_NAMES[axis_idx]
-    sp_key, gyro_key = f"setpoint_{axis.lower()}", f"gyro_{axis.lower()}"
+    gyro_key = f"gyro_{axis.lower()}"
+    # Prefer the logged rate setpoint (axisRate, deg/s). Falling back to rcCommand
+    # compares stick units (+-500) against gyro deg/s: in Acro a perfectly tracked
+    # step then reads as ~40% overshoot on roll/pitch at rate 70, because INAV's
+    # setpoint is rcCommand * rate / 50.
+    sp_key = f"rate_sp_{axis.lower()}"
+    setpoint_source = "axisRate"
+    if sp_key not in data:
+        sp_key, setpoint_source = f"setpoint_{axis.lower()}", "rcCommand"
     if sp_key not in data or gyro_key not in data:
         return None
     sp, gy = data[sp_key].copy(), data[gyro_key].copy()
     mask = ~(np.isnan(sp) | np.isnan(gy))
+
+    # Step response is only meaningful where the stick commands a *rate*. In Angle
+    # and every nav mode the pilot commands an attitude or a position, and the rate
+    # setpoint is shaped by an outer controller, so "overshoot" there measures the
+    # outer loop, not this PID. Restrict to Acro when there is enough of it.
+    acro = rate_mode_mask(data)
+    acro_seconds = None
+    mode_filtered = False
+    if acro is not None and len(acro) == len(mask):
+        acro_seconds = float(np.sum(acro & mask)) / sr
+        if acro_seconds >= MIN_ACRO_SECONDS_FOR_STEPS:
+            mask = mask & acro
+            mode_filtered = True
+
     sp, gy = sp[mask], gy[mask]
     if len(sp) < 100:
         return None
@@ -2861,7 +2949,9 @@ def analyze_pid_response(data, axis_idx, sr):
 
     return {"axis": axis, "rms_error": rms_error, "tracking_delay_ms": avg_delay,
             "avg_overshoot_pct": avg_overshoot, "n_steps": n_steps_analyzed,
-            "setpoint": sp, "gyro": gy, "pid_stats": pid_stats}
+            "setpoint": sp, "gyro": gy, "pid_stats": pid_stats,
+            "setpoint_source": setpoint_source, "acro_only": mode_filtered,
+            "acro_seconds": acro_seconds}
 
 
 def analyze_motors(data, sr, config=None):
@@ -6611,6 +6701,16 @@ def print_terminal_report(plan, noise_results, pid_results, motor_analysis, conf
             dl_str = f"{DIM}  N/A{R}"
         step_hint = f"  {DIM}({n_steps} steps){R}" if n_steps < 5 and (_os is None or _dl is None) else ""
         print(f"    {pid['axis']:6s}  OS:{os_str}  Delay:{dl_str}  Err:{pid['rms_error']:.1f}{step_hint}")
+    _ref = next((p for p in pid_results if p), None)
+    if _ref is not None:
+        _src = "rate setpoint (axisRate)" if _ref.get("setpoint_source") == "axisRate" else "stick (rcCommand) - uncalibrated"
+        if _ref.get("acro_only"):
+            _scope = f"Acro only, {_ref['acro_seconds']:.0f}s"
+        elif _ref.get("acro_seconds") is not None:
+            _scope = f"whole log - only {_ref['acro_seconds']:.0f}s of Acro, Angle/nav segments included"
+        else:
+            _scope = "whole log - no flight-mode data"
+        print(f"    {DIM}(step response vs {_src}; {_scope}){R}")
     if motor_analysis:
         if motor_analysis.get("idle_detected", False):
             print(f"    Motors: {DIM}idle/ground (no throttle variation - skipping saturation analysis){R}")
@@ -12329,6 +12429,10 @@ def _analyze_single_log(logfile, args, config_raw=None, summary_only=False):
     sr = data["sample_rate"]
     if not summary_only:
         print(f"  {data['n_rows']:,} rows | {sr:.0f}Hz | {data['time_s'][-1]:.1f}s")
+        _fm = flight_mode_breakdown(data, sr)
+        if _fm:
+            _parts = [f"{k} {v:.0f}s" for k, v in _fm.items() if v >= 0.5]
+            print(f"  Flight modes: {', '.join(_parts) if _parts else 'n/a'}")
 
         # Automatic log quality check
         quality = assess_log_quality(data, config, logfile)
