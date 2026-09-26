@@ -5,6 +5,21 @@ All notable changes to this fork, relative to the verbatim upstream import.
 Format: each entry corresponds to one commit. See `git log` for full reasoning and the
 measurements behind each change.
 
+## [2.23.4] — 2026-09-26
+
+### Fixed
+
+- **Ground time contaminated the noise, vibration and PID metrics.** Seconds spent armed on
+  the ground with the props turning were averaged in with the flight. On a real 523 s log
+  pitch and yaw read −4 dB over the first ten seconds against −24/−29 dB in flight, pushing
+  the whole-log noise score from 14 to 1 even though the flying was slightly cleaner than
+  the previous flight. `find_airborne_span()` now detects the flight span from barometric
+  altitude (falling back to motor output), and noise, D-term noise, accelerometer vibration,
+  motor statistics, hover oscillation and PID response are measured on it. Nav analysis,
+  flight modes, the map and power analysis still use the whole log, and the report prints
+  what was excluded. Half-second smoothing before thresholding stops a single-sample baro
+  spike from marking an entire log as airborne.
+
 ## [2.23.3] — 2026-09-22
 
 ### Fixed
