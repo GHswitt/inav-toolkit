@@ -1440,3 +1440,61 @@ if __name__ == "__main__":
         print(f"  {passed} passed, {skipped} skipped, {failed} FAILED")
     print(f"{'=' * 60}")
     sys.exit(1 if failed else 0)
+
+
+class TestAirborneSpan:
+    """Ground time -- armed with props turning -- is not flight and swamps the
+    noise and vibration metrics, so it is excluded."""
+
+    def _log(self, sr=1000, ground_s=5, flight_s=60, land_s=4):
+        n = int((ground_s + flight_s + land_s) * sr)
+        alt = np.zeros(n)
+        alt[int(ground_s * sr):int((ground_s + flight_s) * sr)] = 2000.0   # 20 m
+        mot = np.full(n, 1100.0)
+        mot[int(ground_s * sr):int((ground_s + flight_s) * sr)] = 1400.0
+        return {"n_rows": n, "time_s": np.arange(n) / sr, "sample_rate": sr,
+                "baro_alt": alt, "motor0": mot, "motor1": mot,
+                "motor2": mot, "motor3": mot}
+
+    def test_excludes_ground_time(self):
+        from inav_toolkit.blackbox_analyzer import find_airborne_span
+        sr = 1000
+        span = find_airborne_span(self._log(sr=sr), sr)
+        assert span is not None
+        start, end = span
+        assert 5.0 * sr <= start <= 7.0 * sr      # takeoff at 5 s, plus margin
+        assert 63.0 * sr <= end <= 65.5 * sr      # landing at 65 s, minus margin
+
+    def test_survives_a_baro_spike_at_sample_zero(self):
+        """A single-sample spike must not mark the whole log airborne."""
+        from inav_toolkit.blackbox_analyzer import find_airborne_span
+        sr = 1000
+        data = self._log(sr=sr)
+        data["baro_alt"] = data["baro_alt"].copy()
+        data["baro_alt"][0] = 5000.0
+        start, _ = find_airborne_span(data, sr)
+        assert start >= 4.0 * sr
+
+    def test_falls_back_to_motors_without_baro(self):
+        from inav_toolkit.blackbox_analyzer import find_airborne_span
+        sr = 1000
+        data = self._log(sr=sr)
+        del data["baro_alt"]
+        span = find_airborne_span(data, sr)
+        assert span is not None and span[0] >= 4.0 * sr
+
+    def test_returns_none_when_too_short_to_judge(self):
+        from inav_toolkit.blackbox_analyzer import find_airborne_span
+        sr = 1000
+        assert find_airborne_span(self._log(sr=sr, flight_s=3), sr) is None
+
+    def test_restrict_slices_only_per_sample_arrays(self):
+        from inav_toolkit.blackbox_analyzer import restrict_to_span
+        sr = 1000
+        data = self._log(sr=sr)
+        data["_slow_frames"] = [(0, {"activeFlightModeFlags": 0})]
+        out = restrict_to_span(data, (1000, 3000))
+        assert out["n_rows"] == 2000
+        assert len(out["baro_alt"]) == 2000
+        assert out["_slow_frames"] is data["_slow_frames"]   # aux frames untouched
+        assert len(data["baro_alt"]) == int(69 * sr)          # original unchanged

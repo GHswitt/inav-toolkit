@@ -2118,6 +2118,87 @@ def find_noise_peaks(freqs, psd_db, n_peaks=5, min_height_db=-30, min_prominence
     return results
 
 
+# Ground time -- armed with the props turning, before takeoff and after landing --
+# is not flight. The frame rests on its legs instead of hanging free, so prop
+# vibration is transmitted straight back into the airframe and the structure rings.
+# On a real log the first 10 s read -4 dB on pitch and yaw against -24/-29 dB for the
+# rest of the flight, which alone dragged the whole-log noise score from 14 to 1.
+# Landing is worse still: the props are loaded when the legs touch down.
+AIRBORNE_MIN_ALT_CM = 150.0      # above the log's own ground reference
+AIRBORNE_MARGIN_S = 1.0          # skip the takeoff/touchdown transients themselves
+AIRBORNE_MIN_SPAN_S = 10.0       # below this, fall back to the whole log
+
+
+def find_airborne_span(data, sr):
+    """(start, end) sample indices spanning the flight, excluding pre-takeoff and
+    post-landing ground time, or None when it cannot be determined.
+
+    Uses barometric altitude relative to the log's own ground level; falls back to
+    motor output when no barometer is logged. A contiguous span is returned rather
+    than a mask so that time-domain analysis keeps its continuity -- interior
+    touch-and-gos stay included.
+    """
+    n = data.get("n_rows") or len(data.get("time_s", []))
+    if not n or sr <= 0:
+        return None
+    margin = int(AIRBORNE_MARGIN_S * sr)
+
+    flying = None
+    alt = data.get("baro_alt")
+    if alt is not None and len(alt) == n:
+        alt = np.asarray(alt, dtype=float)
+        head = alt[:int(2 * sr)]
+        head = head[~np.isnan(head)]
+        if len(head) > 10:
+            # Median for the ground reference and a half-second mean before
+            # thresholding: barometers throw single-sample spikes, and one at the
+            # very first sample would otherwise mark the whole log as airborne.
+            ref = float(np.median(head))
+            win = max(1, int(0.5 * sr))
+            smooth = np.convolve(np.nan_to_num(alt, nan=ref),
+                                 np.ones(win) / win, mode="same")
+            flying = (smooth - ref) > AIRBORNE_MIN_ALT_CM
+
+    if flying is None or not np.any(flying):
+        motors = [np.asarray(data[f"motor{i}"], dtype=float) for i in range(4)
+                  if f"motor{i}" in data]
+        if not motors:
+            return None
+        mot = np.nanmean(motors, axis=0)
+        lo, hi = np.nanpercentile(mot, 2), np.nanpercentile(mot, 98)
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi - lo < 50:
+            return None
+        flying = mot > lo + 0.35 * (hi - lo)
+
+    idx = np.flatnonzero(flying)
+    if len(idx) == 0:
+        return None
+    start, end = int(idx[0]) + margin, int(idx[-1]) - margin
+    if end - start < AIRBORNE_MIN_SPAN_S * sr:
+        return None
+    return start, end
+
+
+def restrict_to_span(data, span):
+    """Shallow copy of `data` with per-sample arrays sliced to `span`.
+
+    Aux frame lists and scalars are left alone -- they are keyed by frame index,
+    so consumers of those keys should use the unrestricted data.
+    """
+    if not span:
+        return data
+    start, end = span
+    n = data.get("n_rows") or len(data.get("time_s", []))
+    out = dict(data)
+    for k, v in data.items():
+        if k.startswith("_"):
+            continue
+        if isinstance(v, np.ndarray) and v.ndim == 1 and len(v) == n:
+            out[k] = v[start:end]
+    out["n_rows"] = end - start
+    return out
+
+
 def analyze_noise(data, axis_name, gyro_key, sr):
     if gyro_key not in data:
         return None
@@ -12537,15 +12618,26 @@ def _analyze_single_log(logfile, args, config_raw=None, summary_only=False):
         print("  Analyzing...")
 
     # ── Always run core analysis (PID, noise, motors) ──
-    hover_osc = detect_hover_oscillation(data, sr, profile)
-    noise_results = [analyze_noise(data, ax, f"gyro_{ax.lower()}", sr) for ax in AXIS_NAMES]
+    # Noise, vibration and motor statistics are measured on the airborne span only;
+    # ground time with the props turning is not flight and swamps them (see
+    # find_airborne_span). Everything else keeps the full log.
+    _span = find_airborne_span(data, sr)
+    fdata = restrict_to_span(data, _span)
+    if not summary_only and _span:
+        _trim = (data.get("n_rows", 0) - fdata.get("n_rows", 0)) / sr
+        if _trim >= 1.0:
+            print(f"  Airborne span: {fdata['n_rows']/sr:.0f}s "
+                  f"({_trim:.0f}s of ground time excluded from noise, vibration and PID)")
+
+    hover_osc = detect_hover_oscillation(fdata, sr, profile)
+    noise_results = [analyze_noise(fdata, ax, f"gyro_{ax.lower()}", sr) for ax in AXIS_NAMES]
     noise_fp = fingerprint_noise(noise_results, config, prop_harmonics)
-    pid_results = [analyze_pid_response(data, i, sr) for i in range(3)]
-    motor_analysis = analyze_motors(data, sr, config)
-    dterm_results = analyze_dterm_noise(data, sr)
+    pid_results = [analyze_pid_response(fdata, i, sr) for i in range(3)]
+    motor_analysis = analyze_motors(fdata, sr, config)
+    dterm_results = analyze_dterm_noise(fdata, sr)
 
     # ── Accelerometer vibration analysis ──
-    accel_vib = analyze_accel_vibration(data, sr, prop_harmonics)
+    accel_vib = analyze_accel_vibration(fdata, sr, prop_harmonics)
     if not summary_only and accel_vib and accel_vib.get("axes"):
         vib_score = accel_vib.get("score", 100)
         if vib_score < 85:
