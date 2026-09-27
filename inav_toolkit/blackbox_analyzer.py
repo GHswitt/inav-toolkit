@@ -104,7 +104,7 @@ def _disable_colors():
 AXIS_NAMES = ["Roll", "Pitch", "Yaw"]
 AXIS_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D"]
 MOTOR_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D", "#A78BFA"]
-REPORT_VERSION = "2.23.8"
+REPORT_VERSION = "2.23.9"
 
 # ─── Frame and Prop Profiles ─────────────────────────────────────────────────
 # Two separate concerns:
@@ -1664,6 +1664,10 @@ class BlackboxDecoder:
             "att_roll": ["attitude[0]"], "att_pitch": ["attitude[1]"], "att_heading": ["attitude[2]"],
             "baro_alt": ["BaroAlt"],
             "acc_x": ["accSmooth[0]"], "acc_y": ["accSmooth[1]"], "acc_z": ["accSmooth[2]"],
+            # INAV computes its own vibration level (accGetVibrationLevel() * acc_1G,
+            # blackbox.c:1672) and logs it. Nothing here read it, so the analyzer
+            # recomputed a worse figure from raw accel instead.
+            "acc_vib": ["accVib"],
             "throttle": ["rcCommand[3]"],
             "rc_roll": ["rcData[0]"], "rc_pitch": ["rcData[1]"],
             "rc_yaw": ["rcData[2]"], "rc_throttle": ["rcData[3]"],
@@ -1764,6 +1768,21 @@ def decode_blackbox_native(filepath, raw_params, quiet=False):
     data["_gps_frames"] = decoder.gps_frames      # [(frame_idx, {field: value})]
     data["_decoder_stats"] = decoder.stats         # {i_frames, p_frames, errors, ...}
     data["active_modes"] = _active_mode_series(decoder.slow_frames, len(data.get("time_s", [])))
+
+    # accSmooth is in units of 1/acc_1G g, not cm/s^2: the firmware writes
+    # accADC[i] = accADCf[i] * acc_1G (blackbox.c:1645) and accADCf is already in g.
+    # acc_1G is sensor-dependent, so it must be read rather than assumed; the header
+    # publishes it.
+    try:
+        data["_acc_1g"] = float(raw_params.get("acc_1G", ACC_1G_DEFAULT))
+    except (TypeError, ValueError):
+        data["_acc_1g"] = ACC_1G_DEFAULT
+    if data["_acc_1g"] <= 0:
+        data["_acc_1g"] = ACC_1G_DEFAULT
+    try:
+        data["_acc_lpf_hz"] = float(raw_params.get("acc_lpf_hz", 0) or 0)
+    except (TypeError, ValueError):
+        data["_acc_lpf_hz"] = 0.0
 
     # Reject physically impossible samples before any metric sees them. Done here,
     # once, so every downstream analysis inherits it rather than each having to
@@ -3517,6 +3536,48 @@ def analyze_dterm_noise(data, sr):
 
 _ACCEL_AXIS_MAP = {"X": "acc_x", "Y": "acc_y", "Z": "acc_z"}
 
+# accSmooth is scaled by the sensor's acc_1G, which the blackbox header publishes.
+# 2048 is the common INAV value and serves only as a fallback.
+ACC_1G_DEFAULT = 2048.0
+# Vibration is what remains once the pilot's manoeuvres are removed. 5 Hz keeps
+# frame resonance and propwash while dropping loops and rolls -- the same split
+# INAV itself uses (acceleration.c: 5 Hz PT1 as a floor, squared difference
+# smoothed at 2 Hz, vector-summed across axes).
+VIBRATION_MIN_HZ = 5.0
+VIBRATION_HF_HZ = 50.0
+
+# accSmooth is logged AFTER acc_lpf_hz and the optional notch, while INAV computes
+# accVib from the UNFILTERED signal (acceleration.c:607, before the soft LPF at
+# :616). With the default acc_lpf_hz = 15 the logged accel has no content at prop
+# frequencies at all, so a vibration figure derived from it measures the filter's
+# stopband rather than the airframe: one log read 0.011 g "above 50 Hz" through a
+# 15 Hz lowpass while INAV's own accVib reported 0.644 g. Below this cutoff the
+# logged accel cannot support a vibration verdict and we defer to accVib.
+ACC_LPF_TRUSTWORTHY_HZ = 50.0
+
+# Thresholds for INAV's own accVib (g RMS, 3-axis, pre-filter). ArduPilot treats
+# its equivalent VIBE as acceptable to ~1.5 g and problematic above ~3 g; these
+# sit deliberately below that, since accVib is a mean over the flight.
+FC_VIB_OK_G = 0.6
+FC_VIB_BAD_G = 1.5
+
+# Below this, an X/Y vibration ratio is noise over noise, not an asymmetric fault.
+ASYMMETRY_MIN_G = 0.2
+
+
+def _highpass_rms(x, sr, cutoff):
+    """RMS of `x` above `cutoff` Hz."""
+    x = np.asarray(x, dtype=float)
+    if len(x) < 32 or sr <= 2 * cutoff:
+        return float(np.sqrt(np.mean(x ** 2))) if len(x) else 0.0
+    try:
+        from scipy.signal import butter, sosfiltfilt
+        sos = butter(2, cutoff / (sr / 2), btype="high", output="sos")
+        return float(np.sqrt(np.mean(sosfiltfilt(sos, x) ** 2)))
+    except Exception:
+        return float(np.sqrt(np.mean(x ** 2)))
+
+
 def analyze_accel_vibration(data, sr, prop_harmonics=None):
     """Analyze accelerometer data for structural vibration signatures.
 
@@ -3548,6 +3609,13 @@ def analyze_accel_vibration(data, sr, prop_harmonics=None):
 
     all_rms = []
     score = 100
+    acc_1g = float(data.get("_acc_1g") or ACC_1G_DEFAULT)
+    results["acc_1g"] = acc_1g
+    acc_lpf_hz = float(data.get("_acc_lpf_hz") or 0.0)
+    results["acc_lpf_hz"] = acc_lpf_hz
+    # Whether the logged accel can support a vibration verdict at all.
+    band_limited = 0.0 < acc_lpf_hz < ACC_LPF_TRUSTWORTHY_HZ
+    results["band_limited"] = band_limited
 
     for axis_name, key in _ACCEL_AXIS_MAP.items():
         raw = data[key]
@@ -3555,13 +3623,27 @@ def analyze_accel_vibration(data, sr, prop_harmonics=None):
         if len(clean) < 512:
             continue
 
-        # Convert to g (INAV accel is in cm/s², 1g = 981 cm/s²)
-        # Remove DC offset (gravity) — we only care about vibration
-        clean_g = clean / 981.0
+        # accSmooth is in units of 1/acc_1G g. The firmware writes
+        # accADC[i] = accADCf[i] * acc_1G (blackbox.c:1645) with accADCf already in
+        # g, and the header publishes acc_1G (2048 on this board). Dividing by 981
+        # -- as if the field were cm/s^2 -- overstated every figure by 2048/981 =
+        # 2.09x. Checked against physics: mean acc_z over one airborne span is 2156
+        # raw, which is 1.053 g at acc_1G, and 2.198 g at 981. A hovering quad reads
+        # 1 g. acc_1G is sensor-dependent, so it is read, never assumed.
+        clean_g = clean / acc_1g
         clean_g = clean_g - np.mean(clean_g)
 
         rms_g = float(np.sqrt(np.mean(clean_g**2)))
-        all_rms.append(rms_g)
+
+        # Broadband RMS about the mean is dominated by flying, not vibration. On a
+        # log with 211 s of Acro including loops, Z measured 0.314 g broadband of
+        # which 0.287 g was below 5 Hz -- the manoeuvres -- and only 0.011 g above
+        # 50 Hz. Sub-5 Hz was already excluded from peak detection but not from the
+        # RMS the findings were based on, so a very clean frame was reported as
+        # "High vibration". Vibration is judged on the high-passed signal.
+        vib_g = _highpass_rms(clean_g, sr, VIBRATION_MIN_HZ)
+        hf_g = _highpass_rms(clean_g, sr, VIBRATION_HF_HZ)
+        all_rms.append(vib_g)
 
         # FFT
         freqs, psd_db = compute_psd(clean_g, sr)
@@ -3617,20 +3699,25 @@ def analyze_accel_vibration(data, sr, prop_harmonics=None):
                     "source": "electrical_hf",
                 })
 
-        # RMS severity per axis
-        if rms_g > 0.5:
+        # RMS severity per axis, on the high-passed signal only -- and only when the
+        # logged accel has the bandwidth to see vibration in the first place.
+        if band_limited:
+            pass
+        elif vib_g > 0.5:
             score -= 15
             axis_findings.append({
                 "level": "WARNING",
-                "text": f"{axis_name}: High vibration ({rms_g:.2f}g RMS)",
+                "text": f"{axis_name}: High vibration ({vib_g:.2f}g RMS above "
+                        f"{VIBRATION_MIN_HZ:.0f}Hz)",
                 "detail": "Excessive vibration — check props, motors, frame hardware.",
                 "source": "rms_high",
             })
-        elif rms_g > 0.2:
+        elif vib_g > 0.2:
             score -= 5
             axis_findings.append({
                 "level": "INFO",
-                "text": f"{axis_name}: Moderate vibration ({rms_g:.2f}g RMS)",
+                "text": f"{axis_name}: Moderate vibration ({vib_g:.2f}g RMS above "
+                        f"{VIBRATION_MIN_HZ:.0f}Hz)",
                 "detail": "Some vibration present. Monitor for degradation.",
                 "source": "rms_moderate",
             })
@@ -3640,16 +3727,72 @@ def analyze_accel_vibration(data, sr, prop_harmonics=None):
             "freqs": freqs,
             "psd_db": psd_db,
             "peaks": peaks,
-            "rms_g": rms_g,
+            "rms_g": vib_g,             # vibration: what the findings judge
+            "rms_broadband_g": rms_g,   # includes the pilot's manoeuvres
+            "rms_vib_g": vib_g,
+            "rms_hf_g": hf_g,
             "findings": axis_findings,
         })
 
     if all_rms:
         results["overall_rms_g"] = float(np.sqrt(np.mean(np.array(all_rms)**2)))
 
+    # INAV's own vibration level, if the log carries it. The FC already computes
+    # this; preferring it over our reconstruction is both cheaper and more
+    # authoritative (blackbox.c:1672).
+    fc_vib = data.get("acc_vib")
+    if fc_vib is not None and len(fc_vib):
+        v = np.asarray(fc_vib, dtype=float)
+        v = v[~np.isnan(v)]
+        if len(v):
+            mean_g = float(np.mean(v)) / acc_1g
+            results["fc_vib_mean_g"] = mean_g
+            results["fc_vib_max_g"] = float(np.max(v)) / acc_1g
+            results["fc_vib_p95_g"] = float(np.percentile(v, 95)) / acc_1g
+            # This is the authoritative figure: computed pre-filter, 3-axis, by the
+            # FC itself. Judge on it.
+            if mean_g > FC_VIB_BAD_G:
+                score -= 30
+                results["findings"].append({
+                    "level": "WARNING",
+                    "text": f"Vibration {mean_g:.2f}g RMS (INAV accVib, mean; "
+                            f"peak {results['fc_vib_max_g']:.2f}g)",
+                    "detail": "Measured by the FC before accelerometer filtering. "
+                              "Check prop balance and condition, motor bearings, and "
+                              "frame hardware; soft-mount the FC if it is hard-mounted.",
+                    "source": "fc_vib",
+                })
+            elif mean_g > FC_VIB_OK_G:
+                score -= 10
+                results["findings"].append({
+                    "level": "INFO",
+                    "text": f"Moderate vibration {mean_g:.2f}g RMS (INAV accVib, mean; "
+                            f"peak {results['fc_vib_max_g']:.2f}g)",
+                    "detail": "Not alarming, but worth watching for degradation.",
+                    "source": "fc_vib",
+                })
+    elif band_limited:
+        results["findings"].append({
+            "level": "INFO",
+            "text": f"Vibration not assessed: accSmooth is lowpassed at "
+                    f"{acc_lpf_hz:.0f}Hz and this log has no accVib field",
+            "detail": "The logged accelerometer signal has no content at prop "
+                      "frequencies, so a vibration figure from it would measure the "
+                      "filter, not the airframe. Enable the accVib blackbox field, or "
+                      "judge vibration from the gyro spectrum instead.",
+            "source": "vib_unavailable",
+        })
+
     # Cross-axis comparison: Z should be highest (gravity axis), X/Y similar
+    # Asymmetry is a ratio, so it needs an absolute floor: dividing two near-zero
+    # numbers says nothing about the airframe. One log reported "X-axis vibration
+    # 3.1x higher" from X=0.075g against Y=0.024g, while another at 2.9x on
+    # 0.055/0.019 stayed silent -- a knife-edge on quantities too small to mean
+    # anything. And when band_limited these are the filter's passband, not the
+    # frame, so no mechanical claim can rest on them.
     axis_rms = {a["axis"]: a["rms_g"] for a in results["axes"]}
-    if "X" in axis_rms and "Y" in axis_rms:
+    if ("X" in axis_rms and "Y" in axis_rms and not band_limited
+            and max(axis_rms["X"], axis_rms["Y"]) >= ASYMMETRY_MIN_G):
         xy_ratio = max(axis_rms["X"], axis_rms["Y"]) / max(min(axis_rms["X"], axis_rms["Y"]), 0.001)
         if xy_ratio > 3.0:
             worse_axis = "X" if axis_rms["X"] > axis_rms["Y"] else "Y"

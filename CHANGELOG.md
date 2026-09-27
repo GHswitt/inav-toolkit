@@ -5,6 +5,50 @@ All notable changes to this fork, relative to the verbatim upstream import.
 Format: each entry corresponds to one commit. See `git log` for full reasoning and the
 measurements behind each change.
 
+## [2.23.9] — 2026-09-27
+
+### Fixed
+
+- **Accelerometer vibration was overstated ~60x, by three compounding errors.** One clean 7-inch
+  log reported `Z: High vibration (0.66g RMS)`.
+
+  1. **Wrong unit.** The code divided `accSmooth` by 981 "because INAV accel is in cm/s²". It is
+     not: the firmware writes `accADC[i] = accADCf[i] * acc_1G` (`blackbox.c:1645`) with
+     `accADCf` already in g, and the header publishes `acc_1G` (2048 here). Checked against
+     physics — mean `acc_z` over an airborne span is 2156 raw, which is **1.053 g** at `acc_1G`
+     and **2.198 g** at 981; a hovering quad reads 1 g. `acc_1G` is sensor-dependent, so it is
+     now read, never assumed (a test runs the whole analysis at `acc_1g = 512`).
+  2. **Manoeuvres counted as vibration.** `rms_g` was broadband about the mean. Sub-5 Hz was
+     excluded from *peak* detection but not from the RMS the findings used, so on a log with
+     211 s of Acro including loops, Z measured 0.314 g broadband of which **0.287 g was below
+     5 Hz**. Vibration is now judged on the 5 Hz high-passed signal, matching INAV's own method
+     (`acceleration.c`: 5 Hz PT1 floor, squared difference smoothed at 2 Hz, vector-summed).
+  3. **The logged signal cannot see vibration at all when `acc_lpf_hz` is low.** `accSmooth` is
+     written *after* the accel soft LPF and notch, while INAV computes `accVib` *before* them
+     (`acceleration.c:607` vs `:616`). With the default `acc_lpf_hz = 15` there is no content at
+     prop frequencies, so a figure from it measures the filter's stopband: that log read
+     **0.011 g "above 50 Hz"** through a 15 Hz lowpass while INAV's own `accVib` reported
+     **0.644 g**. Logs below `ACC_LPF_TRUSTWORTHY_HZ` are now marked `band_limited` and yield no
+     verdict from `accSmooth`.
+
+  **`accVib` is now mapped and authoritative.** INAV logs its own pre-filter, 3-axis vibration
+  level and nothing read the field (same gap as `gyroRaw` in 2.23.0). It drives the verdict, with
+  mean/p95/max reported. Thresholds 0.6 g moderate / 1.5 g warning, set below ArduPilot's ~1.5 g
+  acceptable / ~3 g problematic for its equivalent VIBE, since this is a flight mean. A
+  band-limited log with no `accVib` now says the assessment is unavailable and points at the gyro
+  spectrum, instead of inventing a number.
+
+- **X/Y asymmetry was a ratio with no floor.** `max/min` over two near-zero figures: one log
+  reported "X-axis vibration 3.1× higher" from X=0.075 g against Y=0.024 g, while another at
+  2.9× on 0.055/0.019 stayed silent — a knife-edge on quantities too small to mean anything.
+  Now requires the louder axis to reach `ASYMMETRY_MIN_G` and the log not to be band-limited,
+  since no mechanical claim can rest on the filter's passband.
+
+  Across three real logs: `accVib` mean **0.357 g** (gentle flight) vs **0.644 / 0.669 g**
+  (aggressive Acro), i.e. the figure tracks how hard the craft is flown rather than a fixed
+  airframe resonance. The spurious "High vibration" and asymmetry warnings are gone; a
+  proportionate "Moderate vibration 0.64g RMS (INAV accVib, mean; peak 3.33g)" remains.
+
 ## [2.23.8] — 2026-09-27
 
 ### Fixed

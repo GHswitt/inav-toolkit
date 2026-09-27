@@ -1936,3 +1936,139 @@ class TestNoiseAmplitudeVeto:
             assert k in r
         assert abs(r["rms_high_dps"] - 6.0 / np.sqrt(2)) < 1.0
         assert r["rms_low_dps"] < 1.0                # nothing down there
+
+
+class TestAccelVibrationScaling:
+    """accSmooth is scaled by acc_1G, and vibration is not the pilot's manoeuvres."""
+
+    SR = 1000.0
+
+    def _data(self, n=40000, acc_1g=2048.0, vib_g=0.0, manoeuvre_g=0.0):
+        t = np.arange(n) / self.SR
+        z = np.ones(n) * acc_1g                       # 1 g of gravity
+        if manoeuvre_g:
+            z = z + manoeuvre_g * acc_1g * np.sin(2*np.pi*0.5*t)   # loops, 0.5 Hz
+        if vib_g:
+            z = z + vib_g * acc_1g * np.sqrt(2) * np.sin(2*np.pi*120*t)
+        return {
+            "n_rows": n, "time_s": t, "_acc_1g": acc_1g,
+            "acc_x": np.zeros(n), "acc_y": np.zeros(n), "acc_z": z,
+        }
+
+    def test_hovering_quad_reads_one_g(self):
+        """The scaling sanity check: /981 would make a hover read 2.2 g."""
+        d = self._data()
+        assert abs(np.mean(d["acc_z"]) / d["_acc_1g"] - 1.0) < 0.01
+
+    def test_acc_1g_is_read_not_assumed(self):
+        from inav_toolkit.blackbox_analyzer import analyze_accel_vibration
+        d = self._data(acc_1g=512.0, vib_g=0.30)
+        r = analyze_accel_vibration(d, self.SR)
+        assert r["acc_1g"] == 512.0
+        z = [a for a in r["axes"] if a["axis"] == "Z"][0]
+        assert abs(z["rms_vib_g"] - 0.30) < 0.05     # right answer at a different scale
+
+    def test_manoeuvres_are_not_vibration(self):
+        """0.3 g of 0.5 Hz flying must not be reported as vibration."""
+        from inav_toolkit.blackbox_analyzer import analyze_accel_vibration
+        d = self._data(manoeuvre_g=0.30)
+        r = analyze_accel_vibration(d, self.SR)
+        z = [a for a in r["axes"] if a["axis"] == "Z"][0]
+        assert z["rms_broadband_g"] > 0.15           # the flying is in there
+        assert z["rms_vib_g"] < 0.02                 # but not called vibration
+        assert not any("vibration" in f["text"].lower()
+                       for f in z["findings"] if f["level"] == "WARNING")
+
+    def test_real_vibration_is_still_caught(self):
+        from inav_toolkit.blackbox_analyzer import analyze_accel_vibration
+        d = self._data(vib_g=0.70)
+        r = analyze_accel_vibration(d, self.SR)
+        z = [a for a in r["axes"] if a["axis"] == "Z"][0]
+        assert z["rms_vib_g"] > 0.5
+        assert any(f["level"] == "WARNING" and "High vibration" in f["text"]
+                   for f in z["findings"])
+
+    def test_findings_name_the_band(self):
+        from inav_toolkit.blackbox_analyzer import analyze_accel_vibration
+        d = self._data(vib_g=0.70)
+        r = analyze_accel_vibration(d, self.SR)
+        z = [a for a in r["axes"] if a["axis"] == "Z"][0]
+        txt = [f["text"] for f in z["findings"]
+               if f.get("source") in ("rms_high", "rms_moderate")][0]
+        assert "above 5Hz" in txt
+
+    def test_fc_vibration_field_is_used_when_present(self):
+        from inav_toolkit.blackbox_analyzer import analyze_accel_vibration
+        d = self._data()
+        d["acc_vib"] = np.full(d["n_rows"], 0.25 * 2048.0)
+        r = analyze_accel_vibration(d, self.SR)
+        assert abs(r["fc_vib_mean_g"] - 0.25) < 0.01
+
+    def test_band_limited_accel_does_not_produce_a_verdict(self):
+        """accSmooth is logged after acc_lpf_hz. At 15Hz it has no content at prop
+        frequencies, so a figure from it measures the filter, not the airframe."""
+        from inav_toolkit.blackbox_analyzer import analyze_accel_vibration
+        d = self._data(vib_g=0.70)
+        d["_acc_lpf_hz"] = 15.0
+        r = analyze_accel_vibration(d, self.SR)
+        assert r["band_limited"] is True
+        z = [a for a in r["axes"] if a["axis"] == "Z"][0]
+        assert not any(f.get("source") in ("rms_high", "rms_moderate")
+                       for f in z["findings"])
+
+    def test_wide_band_accel_still_produces_a_verdict(self):
+        from inav_toolkit.blackbox_analyzer import analyze_accel_vibration
+        d = self._data(vib_g=0.70)
+        d["_acc_lpf_hz"] = 0.0          # no accel lowpass configured
+        r = analyze_accel_vibration(d, self.SR)
+        assert r["band_limited"] is False
+        z = [a for a in r["axes"] if a["axis"] == "Z"][0]
+        assert any(f.get("source") == "rms_high" for f in z["findings"])
+
+    def test_fc_vib_drives_the_verdict_when_present(self):
+        from inav_toolkit.blackbox_analyzer import analyze_accel_vibration
+        d = self._data()
+        d["_acc_lpf_hz"] = 15.0
+        d["acc_vib"] = np.full(d["n_rows"], 2.0 * 2048.0)     # 2 g, genuinely bad
+        r = analyze_accel_vibration(d, self.SR)
+        assert any(f.get("source") == "fc_vib" and f["level"] == "WARNING"
+                   for f in r["findings"])
+        assert r["score"] < 100
+
+    def test_quiet_fc_vib_raises_nothing(self):
+        from inav_toolkit.blackbox_analyzer import analyze_accel_vibration
+        d = self._data()
+        d["_acc_lpf_hz"] = 15.0
+        d["acc_vib"] = np.full(d["n_rows"], 0.2 * 2048.0)
+        r = analyze_accel_vibration(d, self.SR)
+        assert not any(f.get("source") == "fc_vib" for f in r["findings"])
+
+    def test_band_limited_without_accvib_says_so(self):
+        from inav_toolkit.blackbox_analyzer import analyze_accel_vibration
+        d = self._data(vib_g=0.7)
+        d["_acc_lpf_hz"] = 15.0
+        r = analyze_accel_vibration(d, self.SR)
+        assert any(f.get("source") == "vib_unavailable" for f in r["findings"])
+
+    def test_asymmetry_needs_an_absolute_floor(self):
+        """A 3x ratio between 0.075g and 0.024g is noise over noise."""
+        from inav_toolkit.blackbox_analyzer import analyze_accel_vibration
+        n = 40000
+        t = np.arange(n) / self.SR
+        d = {"n_rows": n, "time_s": t, "_acc_1g": 2048.0, "_acc_lpf_hz": 0.0,
+             "acc_x": 0.075 * 2048 * np.sqrt(2) * np.sin(2*np.pi*120*t),
+             "acc_y": 0.024 * 2048 * np.sqrt(2) * np.sin(2*np.pi*120*t),
+             "acc_z": np.ones(n) * 2048.0}
+        r = analyze_accel_vibration(d, self.SR)
+        assert not any("higher than the other" in f["text"] for f in r["findings"])
+
+    def test_asymmetry_still_reported_when_real(self):
+        from inav_toolkit.blackbox_analyzer import analyze_accel_vibration
+        n = 40000
+        t = np.arange(n) / self.SR
+        d = {"n_rows": n, "time_s": t, "_acc_1g": 2048.0, "_acc_lpf_hz": 0.0,
+             "acc_x": 0.60 * 2048 * np.sqrt(2) * np.sin(2*np.pi*120*t),
+             "acc_y": 0.10 * 2048 * np.sqrt(2) * np.sin(2*np.pi*120*t),
+             "acc_z": np.ones(n) * 2048.0}
+        r = analyze_accel_vibration(d, self.SR)
+        assert any("higher than the other" in f["text"] for f in r["findings"])
