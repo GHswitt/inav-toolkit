@@ -5,6 +5,65 @@ All notable changes to this fork, relative to the verbatim upstream import.
 Format: each entry corresponds to one commit. See `git log` for full reasoning and the
 measurements behind each change.
 
+## [2.23.7] — 2026-09-27
+
+### Fixed
+
+- **Position-hold analysis ran on an IDLE phase, and the toilet-bowl test could not work.**
+  A log produced `Oscillatory position drift detected at 0.05Hz (20.0s) - possible toilet bowl,
+  check compass` on a craft whose compass was independently confirmed healthy. Four separate
+  defects:
+
+  1. **The phase was not a hold.** The caller gated on *whether* a nav phase existed
+     (`state_val > 1`) and then chose `max(phases)` over **all** of them, selecting a 74 s
+     `NAV_PID_IDLE` span — the navigation controller was not running. Meanwhile the two
+     genuine `POSHOLD_3D_IN_PROGRESS` segments in the same log (39.5 s and 30.6 s) were never
+     examined. Selection is now made from phases whose `navState` is in
+     `POSITION_HELD_NAV_IDS` (PosHold, RTH loiter, WP hold time — states with a *stationary*
+     hold point; RTH-head-home and WP-enroute are excluded because the target is moving).
+  2. **The target was not yet set.** `navTgtPos` is a step function written once when a hold
+     point is taken (9–11 unique values across a 417 s log), but a phase span begins at the
+     INITIALIZE state, before that write. Leading samples compared position against a target
+     of 0 while the craft was 128 m from the origin. The unset sentinel is now excluded, along
+     with a 2 s settling window after each target step, since right after a new point is taken
+     the craft is travelling *to* it.
+  3. **The spectral test was structurally incapable.** It searched 0.05–0.5 Hz using
+     `nperseg = 20*sr`, whose frequency resolution is exactly 0.05 Hz — so the lowest bin in
+     the band *was* the band edge, and every slow drift peaked there. Dominance was judged
+     against the sum of only ~9 bins, which red noise passes routinely (measured: 0.532 against
+     a 0.4 trigger). It also summed the two error components' PSDs, discarding the phase
+     relationship that *defines* circular motion — so linear sloshing was indistinguishable
+     from an orbit. And a 20 s "period" in a 70 s record is 3.5 cycles, which no periodogram
+     can separate from drift.
+  4. **Angles were unwrapped across excluded gaps**, making each join count as rotation.
+
+  `orbit_test()` replaces the spectral approach with the direct physical measurement: a toilet
+  bowl is a steadily rotating error vector, so count net revolutions and directional
+  consistency on an unbroken stretch. Thresholds: radius > 100 cm, ≥ 1.5 turns, ≥ 65 %
+  consistent. On synthetic cases it detects a 0.1 Hz orbit (6.95 turns, 99 % consistent) and an
+  expanding spiral, while rejecting equal-amplitude linear sloshing (50 % consistent) and
+  random-walk drift (**0 false positives across 40 seeds**). A rotary-spectrum test on the
+  complex path was tried first and discarded: it separated orbit from slosh perfectly
+  (circularity 1.000 vs 0.000) but scored random-walk drift at 0.54, because at 3.5 cycles
+  chance one-sidedness in a single bin is not distinguishable from a real orbit.
+
+  Same log, after: **CEP 7895 → 31.9 cm**, no toilet bowl, PosHold score 75 → 100, measured
+  over 39.5 s of `navState 7` with the provenance reported.
+
+- **`max_drift_cm` could be set by one bad GPS fix.** At a 1 kHz log rate a single sample
+  defines it. The same log reported 44 m max drift against a 32 cm CEP: `navPos` stepped 42 m
+  in **one 1 ms sample** (21891 m/s implied) and spent 0.032 s above 40 m. `drift_p95_cm` and
+  `drift_p99_cm` are now reported, and when the max exceeds 10× p99 the finding says it is an
+  isolated position-estimate discontinuity rather than hold performance, and points at GPS fix
+  quality instead of the nav PIDs.
+
+- **A stale-target guard added earlier in this work was itself wrong** and is corrected here
+  before release: it compared target travel against craft travel, but in a real hold the target
+  is *supposed* to sit still, so that test would have suppressed the genuine catastrophic case
+  of a craft drifting far from a correctly held target. It now tests the unambiguous condition
+  — `navTgtPos` all-zero for the whole log, i.e. never recorded — and a test asserts that a
+  stationary non-zero target is still analysed and its orbit still caught.
+
 ## [2.23.6] — 2026-09-27
 
 ### Fixed

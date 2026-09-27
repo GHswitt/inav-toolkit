@@ -1674,3 +1674,130 @@ class TestBaroSpikes:
         msgs = [m for lvl, m in r["findings"] if "spike" in m]
         assert msgs and "cm off the craft's own vertical motion" in msgs[0]
         assert "open-cell foam" in msgs[0]
+
+
+class TestToiletBowl:
+    """A toilet bowl has to actually go round."""
+
+    SR = 1000.0
+
+    def _path(self, kind, dur=70.0, f=0.1, r=300.0, noise=30.0, seed=1):
+        rng = np.random.default_rng(seed)
+        t = np.arange(int(dur * self.SR)) / self.SR
+        if kind == "bowl":
+            en, ee = r * np.cos(2*np.pi*f*t), r * np.sin(2*np.pi*f*t)
+        elif kind == "spiral":                  # the classic expanding bowl
+            g = r * (0.3 + t / t[-1])
+            en, ee = g * np.cos(2*np.pi*f*t), g * np.sin(2*np.pi*f*t)
+        elif kind == "slosh":                   # straight line, same frequency
+            en, ee = r * np.cos(2*np.pi*f*t), 0.7 * r * np.cos(2*np.pi*f*t)
+        elif kind == "drift":                   # random walk, no periodicity
+            en = np.cumsum(rng.normal(0, 3, len(t)))
+            ee = np.cumsum(rng.normal(0, 3, len(t)))
+        return (en + rng.normal(0, noise, len(t)),
+                ee + rng.normal(0, noise, len(t)))
+
+    def _fires(self, res):
+        from inav_toolkit.blackbox_analyzer import (TB_MIN_RADIUS_CM,
+            TB_MIN_REVOLUTIONS, TB_MIN_CONSISTENCY)
+        return (res is not None and res["radius_cm"] > TB_MIN_RADIUS_CM
+                and abs(res["net_rev"]) >= TB_MIN_REVOLUTIONS
+                and res["consistency"] >= TB_MIN_CONSISTENCY)
+
+    def test_detects_a_circular_orbit(self):
+        from inav_toolkit.blackbox_analyzer import orbit_test
+        r = orbit_test(*self._path("bowl"), self.SR)
+        assert self._fires(r)
+        assert abs(r["period_s"] - 10.0) < 0.5      # 0.1 Hz
+        assert r["consistency"] > 0.9
+
+    def test_detects_an_expanding_spiral(self):
+        from inav_toolkit.blackbox_analyzer import orbit_test
+        assert self._fires(orbit_test(*self._path("spiral"), self.SR))
+
+    def test_rejects_linear_sloshing(self):
+        """Same frequency and amplitude, but not circular -- the old PSD test
+        summed the two components and so could not tell the difference."""
+        from inav_toolkit.blackbox_analyzer import orbit_test
+        r = orbit_test(*self._path("slosh"), self.SR)
+        assert not self._fires(r)
+        assert r["consistency"] < 0.65
+
+    def test_rejects_random_walk_drift_across_seeds(self):
+        from inav_toolkit.blackbox_analyzer import orbit_test
+        fired = sum(self._fires(orbit_test(*self._path("drift", seed=s), self.SR))
+                    for s in range(20))
+        assert fired == 0
+
+    def test_rotation_direction_is_reported(self):
+        from inav_toolkit.blackbox_analyzer import orbit_test
+        ccw = orbit_test(*self._path("bowl"), self.SR)
+        en, ee = self._path("bowl")
+        cw = orbit_test(en, -ee, self.SR)          # mirror -> opposite sense
+        assert ccw["clockwise"] is not cw["clockwise"]
+
+    def test_idle_phase_is_not_position_hold(self):
+        from inav_toolkit.blackbox_analyzer import (POSITION_HELD_NAV_IDS,
+            NAV_PID_IDLE, NAV_PID_ALTHOLD_IN_PROGRESS,
+            NAV_PID_POSHOLD_3D_IN_PROGRESS)
+        assert NAV_PID_IDLE not in POSITION_HELD_NAV_IDS
+        assert NAV_PID_ALTHOLD_IN_PROGRESS not in POSITION_HELD_NAV_IDS
+        assert NAV_PID_POSHOLD_3D_IN_PROGRESS in POSITION_HELD_NAV_IDS
+
+    def test_unrecorded_target_is_refused(self):
+        """navTgtPos all-zero for the whole log means it was never recorded."""
+        from inav_toolkit.blackbox_analyzer import analyze_position_hold
+        n = 40000
+        t = np.arange(n) / self.SR
+        data = {
+            "n_rows": n,
+            "time_s": t,
+            "nav_pos_n": 5000.0 * np.sin(2*np.pi*0.02*t),   # +-50 m of flying
+            "nav_pos_e": 5000.0 * np.cos(2*np.pi*0.02*t),
+            "nav_tgt_n": np.zeros(n),
+            "nav_tgt_e": np.zeros(n),
+        }
+        r = analyze_position_hold(data, self.SR)
+        assert r["stale_target"] is True
+        assert r["cep_cm"] is None
+        assert r["toilet_bowl"] is False
+
+    def test_a_held_target_that_sits_still_is_still_analysed(self):
+        """A stationary target is what a hold point IS. Refusing to analyse it
+        would suppress the genuine case of a craft drifting off a good target."""
+        from inav_toolkit.blackbox_analyzer import analyze_position_hold
+        n = 40000
+        t = np.arange(n) / self.SR
+        en, ee = self._path("bowl", dur=n / self.SR)
+        data = {
+            "n_rows": n,
+            "time_s": t,
+            "nav_pos_n": 2000.0 + en,      # orbiting a fixed, non-zero hold point
+            "nav_pos_e": -3000.0 + ee,
+            "nav_tgt_n": np.full(n, 2000.0),
+            "nav_tgt_e": np.full(n, -3000.0),
+        }
+        r = analyze_position_hold(data, self.SR)
+        assert r["stale_target"] is False
+        assert r["cep_cm"] is not None
+        assert r["toilet_bowl"] is True     # and the orbit is still caught
+
+    def test_single_sample_gps_jump_is_called_out(self):
+        """One bad fix must not be reported as hold performance."""
+        from inav_toolkit.blackbox_analyzer import analyze_position_hold
+        n = 40000
+        rng = np.random.default_rng(5)
+        pn = 2000.0 + rng.normal(0, 30, n)
+        pe = -3000.0 + rng.normal(0, 30, n)
+        pn[20000] += 4200.0                      # 42 m, one sample
+        data = {
+            "n_rows": n, "time_s": np.arange(n) / self.SR,
+            "nav_pos_n": pn, "nav_pos_e": pe,
+            "nav_tgt_n": np.full(n, 2000.0), "nav_tgt_e": np.full(n, -3000.0),
+        }
+        r = analyze_position_hold(data, self.SR)
+        assert r["max_drift_cm"] > 4000
+        assert r["drift_p99_cm"] < 200            # the flight itself is tight
+        assert r["position_discontinuity_cm"] > 4000
+        msgs = [m for lvl, m in r["findings"] if "discontinuity" in m]
+        assert msgs, r["findings"]

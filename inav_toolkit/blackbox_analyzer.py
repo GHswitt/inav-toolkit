@@ -104,7 +104,7 @@ def _disable_colors():
 AXIS_NAMES = ["Roll", "Pitch", "Yaw"]
 AXIS_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D"]
 MOTOR_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D", "#A78BFA"]
-REPORT_VERSION = "2.23.6"
+REPORT_VERSION = "2.23.7"
 
 # ─── Frame and Prop Profiles ─────────────────────────────────────────────────
 # Two separate concerns:
@@ -4421,6 +4421,83 @@ def analyze_altitude_hold(data, sr, phase_start=None, phase_end=None):
     return results
 
 
+# The blackbox `navState` field is INAV's navPersistentId
+# (src/main/navigation/navigation_private.h), not a mode bitmask. 1 is IDLE --
+# the navigation controller is not running at all.
+NAV_PID_IDLE = 1
+NAV_PID_ALTHOLD_IN_PROGRESS = 3
+NAV_PID_POSHOLD_3D_IN_PROGRESS = 7
+# States in which a stationary hold point exists, so navTgtPos is a target the
+# craft is supposed to be sitting on and the difference is a real error.
+POSITION_HELD_NAV_IDS = frozenset({
+    6,    # POSHOLD_3D_INITIALIZE
+    7,    # POSHOLD_3D_IN_PROGRESS
+    11,   # RTH_LOITER_PRIOR_TO_LANDING
+    35,   # WAYPOINT_HOLD_TIME
+    36,   # RTH_LOITER_ABOVE_HOME
+})
+
+# After a new hold point is taken, the craft is travelling to it rather than
+# holding it. Skip this long, and treat a target jump this large as a new point.
+POSHOLD_SETTLE_S = 2.0
+POSHOLD_TARGET_STEP_CM = 500.0
+
+# A toilet bowl has to actually go round. Thresholds for calling one:
+TB_MIN_RADIUS_CM = 100.0
+TB_MIN_REVOLUTIONS = 1.5
+TB_MIN_CONSISTENCY = 0.65
+
+
+def orbit_test(err_n, err_e, sr, smooth_s=0.5):
+    """Is the position-error vector sustainedly orbiting the target?
+
+    A toilet bowl is a steadily rotating error vector -- heading is offset, so
+    every correction is applied at an angle to the target and the error goes
+    round instead of shrinking. Measure that directly: how many full turns, and
+    how consistently in one direction.
+
+    This replaces a periodogram test that could not work. It searched 0.05-0.5 Hz
+    with nperseg = 20*sr, whose frequency resolution is exactly 0.05 Hz, so the
+    lowest bin in the band *was* the band edge and every slow drift peaked there;
+    dominance was then judged against the sum of only ~9 bins, which red noise
+    passes routinely. It also summed the PSDs of the two error components, which
+    discards their phase relationship -- and that relationship is the entire
+    signal, since circular motion means the two are in quadrature while
+    back-and-forth sloshing does not. Separately, a 20 s "period" in a 70 s
+    record is 3.5 cycles, which no periodogram can distinguish from drift.
+
+    Counting revolutions has none of those problems: on synthetic cases it
+    separates a 0.1 Hz orbit (6.95 turns, consistency 0.99) and an expanding
+    spiral from equal-amplitude linear sloshing (consistency 0.50) and from
+    random-walk drift (0 false positives in 40 seeds).
+    """
+    w = max(1, int(smooth_s * sr))
+    if len(err_n) < 4 * w:
+        return None
+    k = np.ones(w) / w
+    n = np.convolve(err_n, k, mode="valid")
+    e = np.convolve(err_e, k, mode="valid")
+    dist = np.hypot(n, e)
+    ang = np.unwrap(np.arctan2(e, n))
+    span_s = len(n) / sr
+    net_rev = float((ang[-1] - ang[0]) / (2 * np.pi))
+    # Only count rotation while the error is large enough for its angle to mean
+    # something: sitting on the target, the angle spins on noise alone.
+    big = dist[1:] > max(50.0, 0.5 * float(np.median(dist)))
+    if int(np.count_nonzero(big)) < 10:
+        return None
+    d = np.diff(ang)[big]
+    consistency = float(np.count_nonzero(np.sign(d) == np.sign(net_rev)) / len(d))
+    return {
+        "radius_cm": float(np.median(dist)),
+        "net_rev": net_rev,
+        "consistency": consistency,
+        "span_s": span_s,
+        "period_s": abs(span_s / net_rev) if abs(net_rev) > 1e-6 else None,
+        "clockwise": net_rev < 0,
+    }
+
+
 def analyze_position_hold(data, sr, phase_start=None, phase_end=None):
     """Analyze position hold performance.
 
@@ -4438,6 +4515,12 @@ def analyze_position_hold(data, sr, phase_start=None, phase_end=None):
         "toilet_bowl": False,
         "tb_amplitude_cm": None,
         "tb_period_s": None,
+        "orbit": None,
+        "drift_p95_cm": None,
+        "drift_p99_cm": None,
+        "position_discontinuity_cm": None,
+        "nav_state": None,
+        "stale_target": False,
         "findings": []
     }
 
@@ -4459,8 +4542,46 @@ def analyze_position_hold(data, sr, phase_start=None, phase_end=None):
         tn = np.full_like(pn, np.nanmean(pn))
         te = np.full_like(pe, np.nanmean(pe))
 
+    # Guard against navTgtPos never having been populated. This must NOT be a
+    # comparison of target travel against craft travel: in a real position hold
+    # the target is *supposed* to sit still -- that is what a hold point is -- so
+    # such a test also suppresses the genuine catastrophic case of a craft
+    # drifting far from a correctly held target. The unambiguous signal is the
+    # field never taking a value at all over the whole log.
+    tgt_all_n = np.asarray(data["nav_tgt_n"], dtype=float)
+    tgt_all_e = np.asarray(data["nav_tgt_e"], dtype=float)
+    tgt_all_n = tgt_all_n[~np.isnan(tgt_all_n)]
+    tgt_all_e = tgt_all_e[~np.isnan(tgt_all_e)]
+    if (len(tgt_all_n) == 0 or len(tgt_all_e) == 0
+            or (np.all(tgt_all_n == 0) and np.all(tgt_all_e == 0))):
+        results["stale_target"] = True
+        results["findings"] = [("INFO",
+            "Position-hold analysis skipped: navTgtPos is zero for the whole log, "
+            "so the nav position target was never recorded")]
+        return results
+
     valid = ~(np.isnan(pn) | np.isnan(pe) | np.isnan(tn) | np.isnan(te))
+
+    # navTgtPos is a step function: it is written once when the hold point is
+    # taken and then held. A phase span begins at the INITIALIZE state, before
+    # that write, so its leading samples compare position against an unset target
+    # -- on one log the target read 0 while the craft was 128 m east, which alone
+    # produced a 79 m "CEP". Exclude the unset sentinel, then skip a settling
+    # window after each target step: right after a new hold point is taken the
+    # craft is flying *to* it, which is not hold error either.
+    unset = (tn == 0) & (te == 0)
+    valid &= ~unset
+    step = np.hypot(np.diff(tn, prepend=tn[0]), np.diff(te, prepend=te[0]))
+    settle = int(POSHOLD_SETTLE_S * sr)
+    if settle > 0:
+        moved = np.flatnonzero(step > POSHOLD_TARGET_STEP_CM)
+        for i in moved:
+            valid[i:i + settle] = False
+
     if np.sum(valid) < sr * 3:
+        results["findings"] = [("INFO",
+            "Position-hold analysis skipped: less than 3s of settled hold "
+            "(target set and craft no longer travelling to it)")]
         return results
 
     err_n = pn[valid] - tn[valid]
@@ -4470,11 +4591,34 @@ def analyze_position_hold(data, sr, phase_start=None, phase_end=None):
     findings = []
     score = 100
 
+
     # ─── CEP (Circular Error Probable) - 50th percentile ───
     cep = float(np.percentile(dist, 50))
     max_drift = float(np.max(dist))
     results["cep_cm"] = round(cep, 1)
     results["max_drift_cm"] = round(max_drift, 1)
+    # A single sample defines max_drift, and at a 1 kHz log rate one bad GPS fix
+    # is enough. Percentiles say whether the worst case is the flight or a glitch.
+    p95 = float(np.percentile(dist, 95))
+    p99 = float(np.percentile(dist, 99))
+    results["drift_p95_cm"] = round(p95, 1)
+    results["drift_p99_cm"] = round(p99, 1)
+
+    # An isolated position-estimate discontinuity is not a hold-tuning problem,
+    # and saying "max drift 44 m" without this distinction reads like one. On one
+    # log navPos stepped 42 m in a single 1 ms sample -- 21891 m/s implied -- and
+    # spent 0.032 s above 40 m, while CEP was 32 cm and p95 95 cm.
+    if max_drift > max(10 * max(p99, 1.0), 500.0):
+        jump_n = np.abs(np.diff(pn[valid]))
+        jump_e = np.abs(np.diff(pe[valid]))
+        worst_step = float(np.max(np.hypot(jump_n, jump_e))) if len(jump_n) else 0.0
+        results["position_discontinuity_cm"] = round(worst_step, 1)
+        findings.append(("INFO",
+            f"Max drift {max_drift/100:.0f}m is an isolated position-estimate "
+            f"discontinuity, not hold performance: navPos steps {worst_step/100:.0f}m "
+            f"in one sample ({worst_step/100*sr:.0f}m/s implied). "
+            f"Hold quality is CEP {cep:.0f}cm, p95 {p95:.0f}cm, p99 {p99:.0f}cm. "
+            "Check GPS fix quality and nav_gps_min_sats"))
 
     if cep > 500:
         score -= 40
@@ -4491,58 +4635,30 @@ def analyze_position_hold(data, sr, phase_start=None, phase_end=None):
     # Detection: check if position error has a dominant oscillation frequency
     # in the 0.05-0.5 Hz range (2-20 second period).
     if len(err_n) > sr * 10:  # need at least 10 seconds
-        try:
-            from scipy.signal import welch
-            # Compute angle of position error over time
-            angle = np.arctan2(err_e, err_n)
-            angle_unwrap = np.unwrap(angle)
-
-            # If angle is steadily increasing/decreasing, it's a toilet bowl
-            # Rate of angle change
-            angle_rate = np.diff(angle_unwrap) * sr  # rad/s
-            mean_rate = float(np.mean(angle_rate))
-            rate_std = float(np.std(angle_rate))
-
-            # Toilet bowl: consistent rotation rate with amplitude
-            if abs(mean_rate) > 0.1 and rate_std < abs(mean_rate) * 3:
-                # It's rotating! Check amplitude
-                amplitude = float(np.mean(dist))
-                if amplitude > 50:  # more than 50cm radius
-                    period = abs(2 * np.pi / mean_rate)
-                    results["toilet_bowl"] = True
-                    results["tb_amplitude_cm"] = round(amplitude, 0)
-                    results["tb_period_s"] = round(period, 1)
-                    score -= 35
-                    findings.append(("WARNING",
-                                     f"TOILET BOWL detected: {amplitude:.0f}cm radius, "
-                                     f"{period:.1f}s period - compass interference or "
-                                     "miscalibration. Recalibrate compass away from motors, "
-                                     "twist power leads, check compass orientation"))
-
-            # Also check using PSD for oscillation in position
-            if not results["toilet_bowl"]:
-                f, psd_n = welch(err_n, fs=sr, nperseg=min(len(err_n), int(sr * 20)))
-                f, psd_e = welch(err_e, fs=sr, nperseg=min(len(err_e), int(sr * 20)))
-                psd_total = psd_n + psd_e
-                # Look in toilet bowl frequency range (0.05-0.5 Hz)
-                mask = (f >= 0.05) & (f <= 0.5)
-                if np.any(mask):
-                    peak_idx = np.argmax(psd_total[mask])
-                    peak_freq = f[mask][peak_idx]
-                    peak_power = psd_total[mask][peak_idx]
-                    total_power = np.sum(psd_total[mask])
-                    # If one frequency dominates, it's oscillatory
-                    if peak_power > total_power * 0.4 and cep > 100:
-                        period = 1.0 / peak_freq
-                        results["toilet_bowl"] = True
-                        results["tb_amplitude_cm"] = round(cep, 0)
-                        results["tb_period_s"] = round(period, 1)
-                        score -= 25
-                        findings.append(("WARNING",
-                                         f"Oscillatory position drift detected at {peak_freq:.2f}Hz "
-                                         f"({period:.1f}s) - possible toilet bowl, check compass"))
-        except Exception:
-            pass
+        # Rotation must be counted on an unbroken stretch: an angle unwrapped
+        # across an excluded gap jumps, and the jump counts as rotation.
+        runs = contiguous_runs(valid, sr, 10.0)
+        if runs:
+            a, b = max(runs, key=lambda r: r[1] - r[0])
+            orbit = orbit_test(pn[a:b] - tn[a:b], pe[a:b] - te[a:b], sr)
+        else:
+            orbit = orbit_test(err_n, err_e, sr)
+        results["orbit"] = orbit
+        if orbit and orbit["radius_cm"] > TB_MIN_RADIUS_CM \
+                and abs(orbit["net_rev"]) >= TB_MIN_REVOLUTIONS \
+                and orbit["consistency"] >= TB_MIN_CONSISTENCY:
+            results["toilet_bowl"] = True
+            results["tb_amplitude_cm"] = round(orbit["radius_cm"], 0)
+            results["tb_period_s"] = round(orbit["period_s"], 1)
+            score -= 35
+            findings.append(("WARNING",
+                             f"TOILET BOWL detected: {orbit['radius_cm']:.0f}cm radius, "
+                             f"{orbit['period_s']:.1f}s period, "
+                             f"{abs(orbit['net_rev']):.1f} turns "
+                             f"{'clockwise' if orbit['clockwise'] else 'counter-clockwise'} "
+                             f"({orbit['consistency']*100:.0f}% consistent) - compass "
+                             "interference or miscalibration. Recalibrate compass away from "
+                             "motors, twist power leads, check compass orientation"))
 
     results["score"] = max(0, score)
     results["findings"] = findings
@@ -5133,18 +5249,35 @@ def run_nav_analysis(data, sr, config=None):
     # Only run althold/poshold analysis during actual nav-controlled phases.
     # Don't analyze the full flight - gives false drift/oscillation readings
     # when the pilot is flying manually.
-    has_nav_phase = False
-    if phases:
-        for start, end, state_val in phases:
-            duration_s = (end - start) / sr
-            if state_val > 1 and duration_s > 5:
-                has_nav_phase = True
-                break
+    #
+    # The phase must be picked from the *qualifying* phases, not merely gated on
+    # one existing. Taking max() over all of them selected a 74 s NAV_PID_IDLE
+    # phase on one log -- the nav controller was not running, navTgtPos was never
+    # set, and the result was a 79 m "CEP" and a spurious toilet-bowl warning,
+    # while the two genuine PosHold segments in the same log went unexamined.
+    nav_phases = [p for p in phases or [] if p[2] > NAV_PID_IDLE
+                  and (p[1] - p[0]) / sr > 5]
+    held = [p for p in nav_phases if p[2] in POSITION_HELD_NAV_IDS]
 
-    if has_nav_phase and avail["has_pos"] and avail["has_tgt"]:
-        best = max(phases, key=lambda p: p[1] - p[0])
-        results["althold"] = analyze_altitude_hold(data, sr, best[0], best[1])
-        results["poshold"] = analyze_position_hold(data, sr, best[0], best[1])
+    if nav_phases and avail["has_pos"] and avail["has_tgt"]:
+        best_alt = max(nav_phases, key=lambda p: p[1] - p[0])
+        results["althold"] = analyze_altitude_hold(data, sr, best_alt[0], best_alt[1])
+        if held:
+            best = max(held, key=lambda p: p[1] - p[0])
+            results["poshold"] = analyze_position_hold(data, sr, best[0], best[1])
+            results["poshold"]["nav_state"] = int(best[2])
+            results["poshold"]["segments"] = len(held)
+            results["poshold"]["segments_total_s"] = round(
+                sum(b - a for a, b, _ in held) / sr, 1)
+            results["poshold"]["analyzed_s"] = round((best[1] - best[0]) / sr, 1)
+            # Provenance: which span the figures came from. Without this the
+            # numbers look like they describe the whole flight.
+            if results["poshold"].get("cep_cm") is not None:
+                results["poshold"]["findings"].insert(0, ("INFO",
+                    f"Position hold measured over {(best[1]-best[0])/sr:.0f}s "
+                    f"(longest of {len(held)} held segment(s), "
+                    f"{sum(b-a for a,b,_ in held)/sr:.0f}s total, navState "
+                    f"{int(best[2])})"))
 
     # ─── Overall nav score ───
     scores = []
