@@ -104,7 +104,7 @@ def _disable_colors():
 AXIS_NAMES = ["Roll", "Pitch", "Yaw"]
 AXIS_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D"]
 MOTOR_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D", "#A78BFA"]
-REPORT_VERSION = "2.23.11"
+REPORT_VERSION = "2.23.12"
 
 # ─── Frame and Prop Profiles ─────────────────────────────────────────────────
 # Two separate concerns:
@@ -2496,6 +2496,11 @@ _NOISE_REMEDIES = {
         "Check for gyro aliasing — ensure gyro_main_lpf_hz is below Nyquist. "
         "Route signal wires away from power/motor wires."
     ),
+    "frame_cadence": (
+        "No action: this is a blackbox decoding artifact at the I-frame cadence, not "
+        "vibration. It appears on every axis with the same waveform and is absent when "
+        "the same file is decoded with a reference decoder. Ignore it and its harmonics."
+    ),
     "unknown": (
         "Unable to classify this noise with high confidence. "
         "Try: tighten all hardware, soft-mount FC, check prop balance, "
@@ -2516,6 +2521,9 @@ def _noise_remedy(source, freq_hz, power_db, n_axes, amplitude_dps=None):
 
     negligible = (amplitude_dps is not None
                   and amplitude_dps < NOISE_AMPLITUDE_OK_DPS)
+    if source == "frame_cadence":
+        # Never dress an artifact in severity language.
+        return _NOISE_REMEDIES["frame_cadence"]
 
     # Add severity context
     if power_db > -5 and not negligible:
@@ -2636,7 +2644,183 @@ def compute_filter_recommendations(noise_results, config, profile=None):
 
     return result
 
-def fingerprint_noise(noise_results, config, prop_harmonics=None):
+# ─── Frame-cadence artifact ────────────────────────────────────────────────────
+#
+# Our native decoder leaves a periodic artifact locked to the I-frame interval.
+# On one log it measured 1.9-2.4 deg/s peak-to-peak with the SAME waveform on all
+# three gyro axes -- including a +1.2 to +1.6 deg/s spike at one phase -- and it
+# was being reported as "Motor/prop imbalance (strong) at 62Hz" with "Propeller
+# harmonics" at 122/184/312 Hz, which are simply 2x, 3x and 5x of it.
+#
+# It is not the firmware: decoding the same file with an independent reference
+# decoder (orangebox) and folding on actual I-frame boundaries gives 0.08-0.32
+# deg/s of formless noise with no cross-axis similarity. See patch 20 for the
+# decode bug itself; this only stops it being diagnosed as a mechanical fault.
+#
+# The discriminator is cross-axis similarity. A rotating imbalance excites the
+# axes differently, so a peak that is near-identical on all three is a logging
+# artifact, not a mass. That keeps a genuine peak which happens to land near the
+# cadence from being suppressed.
+FRAME_CADENCE_TOL_HZ = 2.5
+FRAME_CADENCE_MAX_HARMONIC = 8
+CADENCE_CROSS_AXIS_MIN = 0.80
+CADENCE_MIN_RATIO = 0.05          # folded p-p vs residual RMS, below this ignore
+
+
+def frame_cadence_hz(data, sr):
+    """I-frame rate in Hz from the decoder's own frame counts, or None.
+
+    Derived, never hardcoded: it depends on blackbox_rate_denom and the firmware's
+    I-frame interval, so a fixed 62.5 would be wrong on the next log."""
+    st = data.get("_decoder_stats") or {}
+    i_frames = st.get("i_frames") or 0
+    p_frames = st.get("p_frames") or 0
+    total = i_frames + p_frames
+    if i_frames < 8 or total < 64 or not sr:
+        return None
+    period = total / float(i_frames)
+    if period < 2:
+        return None
+    return float(sr) / period
+
+
+def detect_frame_cadence_artifact(data, sr):
+    """Measure the I-frame-cadence artifact, or None when there is none.
+
+    Returns cadence_hz, the per-axis folded peak-to-peak in deg/s, the mean
+    correlation between axes' folded profiles, and whether it is confirmed."""
+    cad = frame_cadence_hz(data, sr)
+    if not cad:
+        return None
+    period = int(round(sr / cad))
+    if period < 3 or period > 512:
+        return None
+    # Refine: the I-frame interval is a whole number of frames by construction, so
+    # sr/period is exact while the raw frame-count ratio is not. It matters because
+    # the error multiplies with harmonic number -- a ratio of 16.13 gives 62.0 Hz,
+    # whose 6th harmonic lands at 372 Hz against a real peak at 375 Hz (= 6 x 62.5).
+    # That 3 Hz miss left 375 and 437.5 Hz classified as "Propeller harmonics",
+    # which selected a filter recipe that set dynamic_gyro_notch_min_hz = 40.
+    cad = float(sr) / period
+
+    profiles, amps, ratios = {}, {}, {}
+    for axis in ("roll", "pitch", "yaw"):
+        for key in (f"gyro_raw_{axis}", f"gyro_{axis}"):
+            v = data.get(key)
+            if v is None or len(v) < 64 * period:
+                continue
+            a = np.nan_to_num(np.asarray(v, dtype=float))
+            # Remove real motion: it is broadband and would swamp the fold.
+            win = max(4 * period, 8)
+            a = a - np.convolve(a, np.ones(win) / win, mode="same")
+            m = (len(a) // period) * period
+            prof = a[:m].reshape(-1, period).mean(axis=0)
+            resid = float(np.std(a))
+            profiles[axis] = prof
+            amps[axis] = float(np.ptp(prof))
+            ratios[axis] = amps[axis] / resid if resid > 0 else 0.0
+            break
+
+    if len(profiles) < 2:
+        return None
+
+    # Cross-axis similarity of the folded waveform is the discriminator.
+    corrs = []
+    axes = sorted(profiles)
+    for i in range(len(axes)):
+        for j in range(i + 1, len(axes)):
+            x, y = profiles[axes[i]], profiles[axes[j]]
+            if np.std(x) > 0 and np.std(y) > 0:
+                corrs.append(float(np.corrcoef(x, y)[0, 1]))
+    cross = float(np.mean(corrs)) if corrs else 0.0
+
+    confirmed = (cross >= CADENCE_CROSS_AXIS_MIN
+                 and max(ratios.values(), default=0.0) >= CADENCE_MIN_RATIO)
+    return {
+        "cadence_hz": cad,
+        "period_frames": period,
+        "amplitude_dps": amps,
+        "ratio": ratios,
+        "cross_axis_corr": cross,
+        "confirmed": confirmed,
+    }
+
+
+def remove_cadence_artifact(data, sr, cadence):
+    """Subtract the I-frame-cadence artifact from the gyro series, in place.
+
+    Tagging the peaks is not enough. The aggregate noise floor is computed in dB
+    across the whole spectrum, so an artifact spread over six harmonics inflates
+    `rms_high` and keeps driving decisions that never look at a peak list -- on one
+    log, after every peak was correctly tagged, recipe selection still reported a
+    "high overall noise floor" and recommended `dynamic_gyro_notch_min_hz = 30`.
+
+    What is subtracted is a deterministic, measured waveform: the per-phase mean
+    over thousands of I-frame periods. Anything not locked to that phase averages
+    out of the estimate, so real vibration is left untouched. Returns the number of
+    series corrected.
+    """
+    if not cadence or not cadence.get("confirmed"):
+        return 0
+    period = cadence["period_frames"]
+    n_fixed = 0
+    for axis in ("roll", "pitch", "yaw"):
+        for key in (f"gyro_raw_{axis}", f"gyro_{axis}"):
+            v = data.get(key)
+            if v is None or len(v) < 64 * period:
+                continue
+            a = np.asarray(v, dtype=float).copy()
+            finite = np.isfinite(a)
+            if not finite.any():
+                continue
+            # Estimate on the detrended signal so real motion does not bias the
+            # per-phase means, then subtract from the original.
+            win = max(4 * period, 8)
+            base = np.nan_to_num(a)
+            hp = base - np.convolve(base, np.ones(win) / win, mode="same")
+            m = (len(hp) // period) * period
+            prof = hp[:m].reshape(-1, period).mean(axis=0)
+            prof = prof - prof.mean()          # remove only the periodic shape
+            a[finite] = a[finite] - np.tile(prof, len(a) // period + 1)[:len(a)][finite]
+            data[key] = a
+            n_fixed += 1
+    return n_fixed
+
+
+def flag_cadence_peaks(noise_results, cadence):
+    """Mark peaks that sit on the I-frame cadence, in place, and return the count.
+
+    Done on `noise_results` rather than on a copy inside the fingerprinter because
+    the peak list has several independent consumers -- the filter-cutoff chooser,
+    the dynamic-notch `min_hz` advice, the RPM-filter advice, the propwash report.
+    Tagging in one place and filtering at each consumer is what stops the artifact
+    reappearing through whichever path was missed; the first attempt at this patch
+    tagged only the fingerprint and the notch advice still recommended a change."""
+    if not cadence or not cadence.get("confirmed"):
+        return 0
+    cad = cadence["cadence_hz"]
+    n = 0
+    for nr in noise_results or []:
+        if not nr:
+            continue
+        for pk in nr.get("peaks") or []:
+            if is_frame_cadence_peak(pk.get("freq_hz", 0.0), cad):
+                pk["is_cadence"] = True
+                n += 1
+    return n
+
+
+def is_frame_cadence_peak(freq_hz, cadence_hz, tol=FRAME_CADENCE_TOL_HZ):
+    """True when freq_hz sits on the cadence or one of its harmonics."""
+    if not cadence_hz or cadence_hz <= 0 or freq_hz <= 0:
+        return False
+    for n in range(1, FRAME_CADENCE_MAX_HARMONIC + 1):
+        if abs(freq_hz - n * cadence_hz) <= tol:
+            return True
+    return False
+
+
+def fingerprint_noise(noise_results, config, prop_harmonics=None, cadence=None):
     """Identify the likely source of each noise peak across all axes.
 
     Classifies peaks as: prop_harmonics, motor_imbalance, structural,
@@ -2654,6 +2838,9 @@ def fingerprint_noise(noise_results, config, prop_harmonics=None):
     # peak belongs to is negligible in absolute terms.
     worst_axis_amplitude_dps = max(
         (nr.get("rms_gt50_dps", 0.0) for nr in noise_results if nr), default=0.0)
+
+    # A confirmed frame-cadence artifact and its harmonics are not mechanical.
+    cadence_hz = (cadence or {}).get("cadence_hz") if (cadence or {}).get("confirmed") else None
 
     n_motors = config.get("_n_motors", 4)
 
@@ -2745,6 +2932,14 @@ def fingerprint_noise(noise_results, config, prop_harmonics=None):
                 detail = f"High frequency ({freq:.0f}Hz) - electrical or resonance artifact"
             confidence = "low"
 
+        if cadence_hz and is_frame_cadence_peak(freq, cadence_hz):
+            source = "frame_cadence"
+            confidence = "high"
+            harmonic = max(1, int(round(freq / cadence_hz)))
+            detail = (f"{freq:.0f}Hz is harmonic {harmonic} of the {cadence_hz:.1f}Hz "
+                      f"blackbox I-frame cadence, not a mechanical source "
+                      f"(identical waveform on all axes; absent from a reference decode)")
+
         classified.append({
             "freq_hz": float(freq),
             "power_db": float(power),
@@ -2763,8 +2958,11 @@ def fingerprint_noise(noise_results, config, prop_harmonics=None):
     summary_parts = []
 
     if classified:
-        by_power = sorted(classified, key=lambda p: p["power_db"], reverse=True)
-        dominant = by_power[0]["source"]
+        # An artifact must never be the dominant "noise source" -- that is what put
+        # "Motor/prop imbalance" at the top of a report for a clean airframe.
+        mechanical = [p for p in classified if p["source"] != "frame_cadence"]
+        by_power = sorted(mechanical or [], key=lambda p: p["power_db"], reverse=True)
+        dominant = by_power[0]["source"] if by_power else "clean"
 
         # Group by source for summary
         sources = {}
@@ -2780,6 +2978,7 @@ def fingerprint_noise(noise_results, config, prop_harmonics=None):
             "propwash": "Propwash",
             "motor_noise": "Motor noise",
             "mechanical": "Mechanical vibration",
+            "frame_cadence": "Blackbox I-frame artifact (not vibration)",
             "vibration": "Low-frequency vibration",
             "high_freq_noise": "High-frequency noise",
             "unknown": "Unidentified noise",
@@ -2790,7 +2989,10 @@ def fingerprint_noise(noise_results, config, prop_harmonics=None):
             freqs_str = ", ".join(f"{p['freq_hz']:.0f}Hz" for p in peaks[:3])
             severity = "strong" if any(p["power_db"] > -10 for p in peaks) else \
                        "moderate" if any(p["power_db"] > -20 for p in peaks) else "mild"
-            summary_parts.append(f"{label} ({severity}) at {freqs_str}")
+            if src == "frame_cadence":
+                summary_parts.append(f"{label} at {freqs_str}")
+            else:
+                summary_parts.append(f"{label} ({severity}) at {freqs_str}")
 
     summary = "; ".join(summary_parts) if summary_parts else "Noise floor is clean - no dominant noise sources detected."
 
@@ -4007,6 +4209,8 @@ def compute_recommended_filter(noise_results, current_hz, filter_type="gyro", pr
     all_peaks = []
     for nr in valid:
         for p in nr["peaks"]:
+            if p.get("is_cadence"):
+                continue            # a decoding artifact is not a peak to avoid
             if p["power_db"] > -20:  # Only avoid strong peaks
                 all_peaks.append(p["freq_hz"])
 
@@ -6246,11 +6450,16 @@ def generate_action_plan(noise_results, pid_results, motor_analysis, dterm_resul
                     "param": "dterm_lpf_hz", "current": "unknown", "new": rec_dterm_lp,
                     "reason": f"D-term noise high - use .bbl for current value"})
 
-    # Dynamic notch / RPM filter recommendations
+    # Dynamic notch / RPM filter recommendations. Cadence peaks are excluded: the
+    # notch cannot track a logging artifact, and recommending
+    # dynamic_gyro_notch_min_hz 60 -> 40 because an artifact sits at 62 Hz was the
+    # false positive this patch exists to stop.
     all_peaks = []
     for nr in noise_results:
         if nr:
             for p in nr["peaks"]:
+                if p.get("is_cadence"):
+                    continue
                 if p["power_db"] > -20 and 50 < p["freq_hz"] < 500:
                     all_peaks.append(p)
     if all_peaks:
@@ -6563,6 +6772,7 @@ def generate_tuning_recipe(noise_results, noise_fp, config, profile, accel_vib=N
     has_electrical = False
     has_propwash = False
     noise_floor_db = -60
+    worst_noise_dps = 0.0
     dominant_freq = None
 
     if noise_fp and noise_fp.get("peaks"):
@@ -6579,6 +6789,7 @@ def generate_tuning_recipe(noise_results, noise_fp, config, profile, accel_vib=N
     for nr in noise_results:
         if nr:
             noise_floor_db = max(noise_floor_db, nr.get("rms_high", -60))
+            worst_noise_dps = max(worst_noise_dps, nr.get("rms_high_dps", 0.0))
 
     # Current filter state
     current_gyro_lpf = config.get("gyro_lowpass_hz", 100)
@@ -6647,8 +6858,13 @@ def generate_tuning_recipe(noise_results, noise_fp, config, profile, accel_vib=N
         reasoning.append(f"Propwash is aerodynamic on {frame_inches}\" — filtering it adds delay and makes it worse")
         reasoning.append(f"Gyro LPF at {target_gyro}Hz — above propwash band to preserve response")
 
-    elif noise_floor_db > -35:
-        # Very noisy — aggressive filtering needed
+    elif noise_floor_db > -35 and worst_noise_dps >= NOISE_AMPLITUDE_OK_DPS:
+        # Very noisy — aggressive filtering needed. The amplitude condition matters:
+        # -35 dB re 1 (deg/s)^2/Hz sounds decisive but corresponds to well under
+        # 1 deg/s on a clean 7-inch. One log sat at -19 dB with 1.7-2.7 deg/s of
+        # actual noise and was handed an aggressive recipe that dropped the gyro
+        # lowpass to 60 Hz and the notch floor to 30 Hz, trading real response for
+        # noise nobody could feel. Same reasoning as the action-level veto.
         recipe_name = "Noise Suppression"
         description = ("High overall noise floor. Aggressive filtering needed to protect motors. "
                        "Fix the noise source (vibration, wiring, prop balance) then re-analyze — "
@@ -12279,7 +12495,10 @@ def _analyze_for_compare(logfile, args, config_raw=None):
 
     rpm_range = estimate_rpm_range(args.kv, args.cells)
     prop_harmonics = estimate_prop_harmonics(rpm_range, n_blades) if rpm_range else None
-    noise_fp = fingerprint_noise(noise_results, config, prop_harmonics)
+    # This path has no airborne-span restriction and no summary_only flag.
+    _cadence = detect_frame_cadence_artifact(data, sr)
+    flag_cadence_peaks(noise_results, _cadence)
+    noise_fp = fingerprint_noise(noise_results, config, prop_harmonics, cadence=_cadence)
 
     motor_response = analyze_motor_response(data, sr)
     phase_lag = None
@@ -13440,9 +13659,21 @@ def _analyze_single_log(logfile, args, config_raw=None, summary_only=False):
             print(f"  Airborne span: {fdata['n_rows']/sr:.0f}s "
                   f"({_trim:.0f}s of ground time excluded from noise, vibration and PID)")
 
+    # Remove the decoder's I-frame artifact before anything measures noise: it
+    # inflates the aggregate floor, not just individual peaks.
+    _cadence = detect_frame_cadence_artifact(fdata, sr)
+    if _cadence and _cadence.get("confirmed"):
+        _amp = max(_cadence["amplitude_dps"].values(), default=0.0)
+        remove_cadence_artifact(fdata, sr, _cadence)
+        if not summary_only:
+            print(f"  Blackbox I-frame artifact at {_cadence['cadence_hz']:.1f}Hz "
+                  f"({_amp:.1f} deg/s p-p, cross-axis r={_cadence['cross_axis_corr']:.2f}) "
+                  f"- subtracted before noise analysis")
+
     hover_osc = detect_hover_oscillation(fdata, sr, profile)
     noise_results = [analyze_noise(fdata, ax, f"gyro_{ax.lower()}", sr) for ax in AXIS_NAMES]
-    noise_fp = fingerprint_noise(noise_results, config, prop_harmonics)
+    flag_cadence_peaks(noise_results, _cadence)
+    noise_fp = fingerprint_noise(noise_results, config, prop_harmonics, cadence=_cadence)
     pid_results = [analyze_pid_response(fdata, i, sr) for i in range(3)]
     motor_analysis = analyze_motors(fdata, sr, config)
     dterm_results = analyze_dterm_noise(fdata, sr)

@@ -2162,3 +2162,127 @@ class TestPosHoldSegments:
         r = analyze_position_hold_segments(d, self.SR, held)
         assert r["segments"] == 1
         assert any("1 held segment" in m for lvl, m in r["findings"])
+
+
+class TestFrameCadenceArtifact:
+    """An I-frame-cadence artifact must not be diagnosed as a mechanical fault."""
+
+    SR = 1000.0
+    PERIOD = 16
+
+    def _log(self, n=64000, cadence_pp=2.0, same_shape=True, real_peak_hz=None,
+             real_amp=3.0, seed=2):
+        rng = np.random.default_rng(seed)
+        t = np.arange(n) / self.SR
+        # one deterministic sawtooth per I-frame period
+        saw = np.zeros(self.PERIOD)
+        saw[11] = cadence_pp * 0.7
+        saw[3:10] = -cadence_pp * 0.3
+        tile = np.tile(saw, n // self.PERIOD + 1)[:n]
+        d = {"n_rows": n, "time_s": t,
+             "_decoder_stats": {"i_frames": n // self.PERIOD,
+                                "p_frames": n - n // self.PERIOD}}
+        for i, axis in enumerate(("roll", "pitch", "yaw")):
+            base = rng.normal(0, 2.0, n)
+            art = tile if same_shape else np.roll(tile, 5 * i) * (1.0 + i)
+            sig = base + art
+            if real_peak_hz:
+                sig = sig + real_amp * np.sin(2 * np.pi * real_peak_hz * t)
+            d[f"gyro_raw_{axis}"] = sig
+            d[f"gyro_{axis}"] = sig
+        return d
+
+    def test_cadence_is_derived_from_frame_counts(self):
+        from inav_toolkit.blackbox_analyzer import frame_cadence_hz
+        d = self._log()
+        assert abs(frame_cadence_hz(d, self.SR) - self.SR / self.PERIOD) < 1.0
+
+    def test_cadence_is_not_hardcoded(self):
+        """A different I-frame interval must give a different cadence."""
+        from inav_toolkit.blackbox_analyzer import frame_cadence_hz
+        d = self._log()
+        d["_decoder_stats"] = {"i_frames": 1000, "p_frames": 31000}   # every 32
+        assert abs(frame_cadence_hz(d, self.SR) - self.SR / 32) < 1.0
+
+    def test_identical_waveform_across_axes_is_confirmed(self):
+        from inav_toolkit.blackbox_analyzer import detect_frame_cadence_artifact
+        r = detect_frame_cadence_artifact(self._log(same_shape=True), self.SR)
+        assert r is not None and r["confirmed"] is True
+        assert r["cross_axis_corr"] > 0.8
+        assert max(r["amplitude_dps"].values()) > 0.5
+
+    def test_axis_asymmetric_content_is_not_confirmed(self):
+        """A real mechanical source excites axes differently -- must NOT be
+        suppressed just because it sits near the cadence."""
+        from inav_toolkit.blackbox_analyzer import detect_frame_cadence_artifact
+        r = detect_frame_cadence_artifact(self._log(same_shape=False), self.SR)
+        assert r is None or r["confirmed"] is False
+
+    def test_harmonics_are_recognised(self):
+        from inav_toolkit.blackbox_analyzer import is_frame_cadence_peak
+        for f in (62.5, 125.0, 187.5, 312.5):
+            assert is_frame_cadence_peak(f, 62.5)
+        for f in (40.0, 95.0, 220.0):
+            assert not is_frame_cadence_peak(f, 62.5)
+
+    def test_cadence_peak_is_tagged_not_called_mechanical(self):
+        from inav_toolkit.blackbox_analyzer import _noise_remedy
+        r = _noise_remedy("frame_cadence", 62.5, -2.0, 3, amplitude_dps=20.0)
+        assert "CRITICAL" not in r
+        assert "decoding artifact" in r
+
+    def test_no_decoder_stats_means_no_detection(self):
+        from inav_toolkit.blackbox_analyzer import detect_frame_cadence_artifact
+        d = self._log()
+        del d["_decoder_stats"]
+        assert detect_frame_cadence_artifact(d, self.SR) is None
+
+    def test_cadence_is_refined_to_a_whole_frame_period(self):
+        """A raw ratio of 16.13 gives 62.0 Hz, whose 6th harmonic misses a real
+        375 Hz peak by 3 Hz. The period is an integer, so sr/period is exact."""
+        from inav_toolkit.blackbox_analyzer import (detect_frame_cadence_artifact,
+                                                    is_frame_cadence_peak)
+        d = self._log()
+        # frame counts that give a non-integer ratio, as a real log does
+        d["_decoder_stats"] = {"i_frames": 25876, "p_frames": 391396}
+        r = detect_frame_cadence_artifact(d, self.SR)
+        assert r is not None
+        assert abs(r["cadence_hz"] - 62.5) < 0.01
+        for f in (62.5, 125.0, 187.5, 250.0, 312.5, 375.0, 437.5):
+            assert is_frame_cadence_peak(f, r["cadence_hz"]), f
+
+    def test_subtraction_removes_the_artifact_not_real_vibration(self):
+        """Only content locked to the I-frame phase may be removed."""
+        from inav_toolkit.blackbox_analyzer import (detect_frame_cadence_artifact,
+                                                    remove_cadence_artifact)
+        n = 64000
+        t = np.arange(n) / self.SR
+        real_hz = 97.0                       # off-cadence, must survive
+        d = self._log(n=n, real_peak_hz=real_hz, real_amp=4.0)
+        before = {k: d[k].copy() for k in d if k.startswith("gyro_raw_")}
+        cad = detect_frame_cadence_artifact(d, self.SR)
+        assert cad and cad["confirmed"]
+        assert remove_cadence_artifact(d, self.SR, cad) > 0
+
+        def amp_at(sig, hz):
+            w = np.hanning(len(sig))
+            sp = np.abs(np.fft.rfft((sig - sig.mean()) * w))
+            fr = np.fft.rfftfreq(len(sig), 1 / self.SR)
+            return sp[np.argmin(np.abs(fr - hz))]
+
+        for k in before:
+            # the cadence line is reduced hard ...
+            b = amp_at(before[k], cad["cadence_hz"])
+            a = amp_at(d[k], cad["cadence_hz"])
+            assert a < b * 0.5, (k, b, a)
+            # ... while the genuine 97 Hz peak is essentially untouched
+            rb = amp_at(before[k], real_hz)
+            ra = amp_at(d[k], real_hz)
+            assert ra > rb * 0.9, (k, rb, ra)
+
+    def test_subtraction_is_a_noop_when_unconfirmed(self):
+        from inav_toolkit.blackbox_analyzer import remove_cadence_artifact
+        d = self._log()
+        before = d["gyro_raw_roll"].copy()
+        assert remove_cadence_artifact(d, self.SR, {"confirmed": False}) == 0
+        assert np.array_equal(d["gyro_raw_roll"], before)

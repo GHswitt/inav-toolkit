@@ -5,6 +5,65 @@ All notable changes to this fork, relative to the verbatim upstream import.
 Format: each entry corresponds to one commit. See `git log` for full reasoning and the
 measurements behind each change.
 
+## [2.23.12] — 2026-09-28
+
+### Fixed
+
+- **A blackbox decoding artifact was being reported as motor/prop imbalance.** Our native decoder
+  leaves a periodic artifact locked to the **I-frame cadence**: on one log 1.9–2.4 deg/s
+  peak-to-peak with the *same waveform on all three gyro axes* (cross-axis r = 0.98), including a
+  +1.2…+1.6 deg/s spike at one phase. It was diagnosed as *"Motor/prop imbalance (strong) at
+  62Hz"* with *"Propeller harmonics"* at 122/184/312 Hz — which are simply its 2nd, 3rd and 5th
+  multiples — and it drove a recommendation to change `dynamic_gyro_notch_min_hz`.
+
+  Confirmed as ours, not the firmware: decoding the same file with an independent reference
+  decoder (`orangebox`) and folding on actual I-frame boundaries gives **0.08–0.32 deg/s of
+  formless noise with no cross-axis similarity**, against our 1.9–2.4 deg/s coherent sawtooth.
+
+  The discriminator is **cross-axis similarity**: a rotating imbalance excites axes differently,
+  so a near-identical waveform on all three is a logging artifact. A test feeds axis-*asymmetric*
+  content at the same frequency and asserts it is **not** suppressed.
+
+  The artifact reached the output through **four independent consumers**, each found only by
+  fixing the previous one:
+
+  | consumer | reads | fix |
+  |---|---|---|
+  | peak classification | tagged peaks | `source: "frame_cadence"`, excluded from dominant source |
+  | notch/RPM advice, filter-cutoff chooser | the raw peak list | `flag_cadence_peaks()` marks `is_cadence` at source |
+  | recipe selection | the dB noise floor, never peaks | amplitude veto (see below) |
+  | propwash display | its own event list | **still open** |
+
+  `frame_cadence_hz()` derives the cadence from `_decoder_stats` and is **never hardcoded** — it
+  depends on `blackbox_rate_denom` and the firmware's I-frame interval. It is then **refined to a
+  whole frame period**, because the raw frame-count ratio (16.13 → 62.0 Hz) is inexact and the
+  error multiplies with harmonic number: 6 × 62.0 = 372 Hz missed a real 375 Hz peak (= 6 × 62.5)
+  by 3 Hz, leaving 375 and 437.5 Hz classified as prop harmonics — which selected a recipe that
+  set `dynamic_gyro_notch_min_hz = 40`. `sr / round(sr/cadence)` is exact.
+
+  `remove_cadence_artifact()` subtracts the measured per-phase waveform before any noise
+  measurement, since the aggregate floor never consults a peak list. What is subtracted is the
+  per-phase mean over thousands of periods with its own mean removed, so only the periodic shape
+  goes; a test puts a genuine 97 Hz peak alongside and asserts the cadence line drops by >50 %
+  while the 97 Hz peak keeps >90 % of its amplitude.
+
+- **Recipe selection had no amplitude check.** `elif noise_floor_db > -35` selected an aggressive
+  "Noise Suppression" recipe — gyro lowpass to 60 Hz, notch floor to 30 Hz — for a log measuring
+  **−19 dB at 1.7–2.7 deg/s**. 2.23.8 put an amplitude veto on *actions*; recipes are a separate
+  path and the same false positive walked straight through. Now gated on
+  `worst_noise_dps >= NOISE_AMPLITUDE_OK_DPS`.
+
+  Net on that log: recipe "Noise Suppression" → **"Balanced"**, and no
+  `dynamic_gyro_notch_min_hz` recommendation at all.
+
+### Known
+
+- The **propwash display** still prints cadence-frequency events (e.g. "17.9°/s RMS at 62Hz"); it
+  builds its own event list and needs the cadence plumbed in separately. Display only, no
+  recommendation attached.
+- The **noise score** still derives from dB alone, so that log still reads Noise:20 at 2.7 deg/s.
+  Unchanged deliberately — scores are recorded per flight downstream.
+
 ## [2.23.11] — 2026-09-28
 
 ### Fixed
