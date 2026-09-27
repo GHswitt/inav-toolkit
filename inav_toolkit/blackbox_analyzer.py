@@ -104,7 +104,7 @@ def _disable_colors():
 AXIS_NAMES = ["Roll", "Pitch", "Yaw"]
 AXIS_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D"]
 MOTOR_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D", "#A78BFA"]
-REPORT_VERSION = "2.23.5"
+REPORT_VERSION = "2.23.6"
 
 # ─── Frame and Prop Profiles ─────────────────────────────────────────────────
 # Two separate concerns:
@@ -4183,6 +4183,75 @@ def analyze_gps_quality(data, sr):
     return results
 
 
+# Baseline window for barometer detrending. Long enough to average the sensor's
+# own noise, short enough that the quadratic fit follows a dive and its pull-out.
+BARO_BASELINE_WINDOW_S = 0.4
+# One pressure disturbance can cross the threshold, dip back under and cross
+# again; excursions closer together than this are the same event.
+BARO_SPIKE_MERGE_S = 0.15
+# Floor for the spike threshold regardless of how quiet the sensor is.
+BARO_SPIKE_MIN_CM = 100.0
+
+
+def baro_detrend(alt, sr):
+    """(residual, method) -- barometric altitude minus the craft's real motion.
+
+    Fits a local quadratic (Savitzky-Golay, order 2) rather than low-passing at
+    0.5 Hz. A 0.5 Hz filter cannot follow a 10 m/s descent: it lags by more than a
+    metre, so the lag lands in the residual and gets charged to the barometer. On
+    one 417 s log with 211 s of Acro that inflated the noise figure from 6 cm to
+    23 cm and manufactured 47 "spikes", 44 of which happened while the craft was
+    moving faster than 1 m/s vertically (median 10 m/s). Worse, the inflated noise
+    raises the 5-sigma threshold derived from it, so the same metric detected only
+    4 of 12 synthetic 1.5 m spikes injected into that log; the quadratic baseline
+    finds all 12. Order 2 tracks constant-acceleration flight exactly, while a
+    disturbance short relative to the window still stands out in full.
+    """
+    alt = np.asarray(alt, dtype=float)
+    if sr > 2 and len(alt) > 16:
+        try:
+            from scipy.signal import savgol_filter
+            win = int(BARO_BASELINE_WINDOW_S * sr) // 2 * 2 + 1
+            win = min(win, (len(alt) - 1) // 2 * 2 + 1)
+            if win >= 5:
+                return alt - savgol_filter(alt, win, 2, mode="interp"), "local quadratic"
+        except Exception:
+            pass
+    if sr > 2:
+        try:
+            from scipy.signal import butter, sosfiltfilt
+            sos = butter(2, 0.5 / (sr / 2), btype="low", output="sos")
+            return alt - sosfiltfilt(sos, alt), "0.5 Hz lowpass"
+        except Exception:
+            pass
+    return alt - np.mean(alt), "mean"
+
+
+def threshold_events(flag, sr, merge_s=0.0):
+    """[(start, end), ...] for each excursion in the boolean array `flag`.
+
+    Excursions separated by less than `merge_s` are joined, so one disturbance
+    counts once rather than once per threshold crossing."""
+    flag = np.asarray(flag, dtype=bool)
+    if flag.size == 0 or not flag.any():
+        return []
+    edges = np.diff(flag.astype(np.int8))
+    starts = list(np.flatnonzero(edges == 1) + 1)
+    ends = list(np.flatnonzero(edges == -1) + 1)
+    if flag[0]:
+        starts.insert(0, 0)
+    if flag[-1]:
+        ends.append(len(flag))
+    gap = int(merge_s * sr)
+    out = []
+    for a, b in zip(starts, ends):
+        if out and a - out[-1][1] <= gap:
+            out[-1] = (out[-1][0], b)
+        else:
+            out.append((int(a), int(b)))
+    return out
+
+
 def analyze_baro_quality(data, sr):
     """Analyze barometer noise and quality.
 
@@ -4198,13 +4267,19 @@ def analyze_baro_quality(data, sr):
         "noise_cm": None,
         "throttle_correlation": None,
         "spikes": 0,
+        "spike_threshold_cm": None,
+        "worst_spike_cm": None,
+        "detrend": None,
         "findings": []
     }
 
     if "baro_alt" not in data:
         return results
 
-    baro = data["baro_alt"]
+    # Props turning on the ground is not flight: the takeoff transient was the
+    # single largest "spike" on one log, at 102 cm against a 100 cm threshold.
+    fdata = restrict_to_span(data, find_airborne_span(data, sr))
+    baro = np.asarray(fdata["baro_alt"], dtype=float)
     valid = ~np.isnan(baro)
     if np.sum(valid) < sr * 5:
         return results
@@ -4213,48 +4288,39 @@ def analyze_baro_quality(data, sr):
     findings = []
     score = 100
 
-    # ─── Detrend altitude (remove intentional climbs/descents) ───
-    # Use a very low-pass filter to get the trend, then subtract.
-    # sosfiltfilt is zero-phase (no startup transient).
-    from scipy.signal import butter, sosfilt, sosfiltfilt
-    try:
-        if sr > 2:
-            sos = butter(2, 0.5 / (sr / 2), btype='low', output='sos')
-            trend = sosfiltfilt(sos, alt)
-            residual = alt - trend
-        else:
-            residual = alt - np.mean(alt)
-    except Exception:
-        residual = alt - np.mean(alt)
+    # ─── Detrend altitude (remove the craft's real vertical motion) ───
+    residual, detrend_method = baro_detrend(alt, sr)
 
     noise_cm = float(np.std(residual))
     results["noise_cm"] = round(noise_cm, 1)
+    results["detrend"] = detrend_method
 
     # ─── Spike detection ───
     # Count contiguous EXCURSIONS, not samples over threshold. At a 1kHz log rate
     # np.sum() scores a single 1-second excursion as 1000 "spikes", which turns a
-    # handful of takeoff transients into an alarming four-digit number.
-    # NOTE: `residual` is measured against a 0.5Hz lowpass trend, so any genuine
-    # climb or descent faster than that filter can track also lands here. Treat a
-    # small event count on a dynamic flight as normal.
-    threshold = max(noise_cm * 5, 100)  # 5 sigma or 1m, whichever is larger
-    over = np.abs(residual) > threshold
-    spikes = int(np.count_nonzero(np.diff(over.astype(np.int8)) == 1))
-    if over.size and over[0]:
-        spikes += 1  # excursion already in progress at the first sample
+    # handful of takeoff transients into an alarming four-digit number. Threshold
+    # crossings within BARO_SPIKE_MERGE_S are one disturbance, not several.
+    threshold = max(noise_cm * 5, BARO_SPIKE_MIN_CM)
+    events = threshold_events(np.abs(residual) > threshold, sr, BARO_SPIKE_MERGE_S)
+    spikes = len(events)
     results["spikes"] = spikes
+    results["spike_threshold_cm"] = round(threshold, 1)
+    if events:
+        results["worst_spike_cm"] = round(
+            float(max(np.abs(residual[a:b]).max() for a, b in events)), 1)
 
     # ─── Throttle correlation ───
     throttle = None
-    if "throttle" in data:
-        throttle = data["throttle"][valid]
-    elif "motor0" in data:
-        throttle = data["motor0"][valid]
+    if "throttle" in fdata:
+        throttle = np.asarray(fdata["throttle"], dtype=float)[valid]
+    elif "motor0" in fdata:
+        throttle = np.asarray(fdata["motor0"], dtype=float)[valid]
 
     if throttle is not None and len(throttle) > 100:
         # Low-pass both signals to compare trends
         try:
             if sr > 4:
+                from scipy.signal import butter, sosfilt
                 sos2 = butter(2, 1.0 / (sr / 2), btype='low', output='sos')
                 baro_lp = sosfilt(sos2, residual)
                 thr_lp = sosfilt(sos2, throttle - np.mean(throttle))
@@ -4276,8 +4342,13 @@ def analyze_baro_quality(data, sr):
 
     if spikes > 3:
         score -= 15
-        findings.append(("WARNING", f"{spikes} baro spike events detected - "
-                         "may cause altitude jumps in althold"))
+        worst = results.get("worst_spike_cm")
+        detail = f", worst {worst:.0f}cm" if worst else ""
+        findings.append(("WARNING",
+                         f"{spikes} baro spike events detected"
+                         f" (>{threshold:.0f}cm off the craft's own vertical motion"
+                         f"{detail}) - may cause altitude jumps in althold. "
+                         "Cover the barometer with open-cell foam"))
 
     corr = results["throttle_correlation"]
     if corr is not None and corr > 0.5:
@@ -8091,7 +8162,9 @@ def _generate_nav_only_html(nav_results, config, data):
                 if r.get("noise_cm") is not None:
                     details.append(f"Noise: {r['noise_cm']:.0f}cm RMS")
                 if r.get("spikes", 0) > 0:
-                    details.append(f"{r['spikes']} spikes")
+                    worst = r.get("worst_spike_cm")
+                    details.append(f"{r['spikes']} spikes"
+                                   + (f" (worst {worst:.0f}cm)" if worst else ""))
                 if r.get("throttle_correlation") is not None:
                     details.append(f"Throttle corr: {r['throttle_correlation']:.2f}")
             elif key == "estimator":

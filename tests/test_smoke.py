@@ -1609,3 +1609,68 @@ class TestCompassWindow:
         r = analyze_compass_health(self._log(n, modes, hdg), self.SR)
         assert r["heading_drift_dps"] is not None
         assert abs(r["heading_drift_dps"]) < 0.01
+
+
+class TestBaroSpikes:
+    """A baro spike is pressure the craft's motion cannot explain."""
+
+    SR = 1000.0
+
+    def _log(self, alt):
+        n = len(alt)
+        return {
+            "n_rows": n,
+            "time_s": np.arange(n) / self.SR,
+            "baro_alt": np.asarray(alt, dtype=float),
+            "motor0": np.full(n, 1500.0), "motor1": np.full(n, 1500.0),
+            "motor2": np.full(n, 1500.0), "motor3": np.full(n, 1500.0),
+        }
+
+    def _dive(self, n=60000):
+        """A 10 m/s descent with a pull-out -- constant-acceleration flight."""
+        t = np.arange(n) / self.SR
+        return 8000.0 - 1000.0 * t + 120.0 * t ** 2
+
+    def test_threshold_events_merges_close_crossings(self):
+        from inav_toolkit.blackbox_analyzer import threshold_events
+        flag = np.zeros(1000, dtype=bool)
+        flag[100:110] = True
+        flag[140:150] = True     # 30 ms later at 1 kHz -> same disturbance
+        flag[600:610] = True
+        assert threshold_events(flag, self.SR, 0.15) == [(100, 150), (600, 610)]
+        assert len(threshold_events(flag, self.SR, 0.0)) == 3
+
+    def test_quadratic_baseline_tracks_a_dive(self):
+        """The old 0.5 Hz lowpass charges its own lag to the barometer."""
+        from inav_toolkit.blackbox_analyzer import baro_detrend
+        alt = self._dive()
+        res, method = baro_detrend(alt, self.SR)
+        assert method == "local quadratic"
+        # Constant acceleration is fit exactly: residual is numerical noise only.
+        assert np.std(res) < 1.0
+
+    def test_dive_alone_raises_no_spikes(self):
+        from inav_toolkit.blackbox_analyzer import analyze_baro_quality
+        r = analyze_baro_quality(self._log(self._dive()), self.SR)
+        assert r["spikes"] == 0
+
+    def test_injected_spikes_are_all_found(self):
+        from inav_toolkit.blackbox_analyzer import analyze_baro_quality
+        alt = self._dive()
+        rng = np.random.default_rng(11)
+        idx = sorted(rng.choice(np.arange(6000, len(alt) - 6000), 8, replace=False))
+        for i in idx:
+            alt[i:i + 50] += 150.0      # 50 ms of 1.5 m false altitude
+        r = analyze_baro_quality(self._log(alt), self.SR)
+        assert r["spikes"] == 8
+        assert r["worst_spike_cm"] > 100
+
+    def test_spike_finding_names_the_threshold(self):
+        from inav_toolkit.blackbox_analyzer import analyze_baro_quality
+        alt = self._dive()
+        for i in range(6000, 54000, 6000):
+            alt[i:i + 50] += 200.0
+        r = analyze_baro_quality(self._log(alt), self.SR)
+        msgs = [m for lvl, m in r["findings"] if "spike" in m]
+        assert msgs and "cm off the craft's own vertical motion" in msgs[0]
+        assert "open-cell foam" in msgs[0]

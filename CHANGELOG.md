@@ -9,6 +9,26 @@ measurements behind each change.
 
 ### Fixed
 
+- **"Baro spike events" were mostly the detrend filter's own lag.** Spikes were counted
+  against a 0.5 Hz lowpass "trend", which cannot follow a fast descent — it lags by more than
+  the 1 m threshold, and the lag is then charged to the barometer. On one 417 s log with 211 s
+  of Acro this reported **47 spike events**, of which **44 occurred while the craft was moving
+  faster than 1 m/s vertically** (median 10 m/s during events; 0.8 m/s over the flight). The
+  two largest were the takeoff transient and a 10 m/s dive. The same lag inflated the noise
+  figure from 6 cm to 23 cm, and because the threshold is `max(5σ, 100 cm)` derived from that
+  noise, the metric also became **insensitive to real spikes: it found only 4 of 12 synthetic
+  1.5 m spikes injected into that log**.
+
+  `baro_detrend()` now fits a local quadratic (Savitzky-Golay, order 2, 0.4 s) instead, which
+  tracks constant-acceleration flight exactly while leaving a short disturbance intact. Spike
+  detection also runs on the airborne span only (the takeoff transient was the single largest
+  "spike", at 102 cm against a 100 cm threshold), and `threshold_events()` merges crossings
+  within 150 ms so one disturbance counts once rather than once per crossing.
+
+  Same log, after: **0 spike events**, noise 23.4 → 5.9 cm. With 12 synthetic spikes injected:
+  **exactly 12 detected**. The warning now names the threshold and the worst excursion, and
+  says what to do about it ("cover the barometer with open-cell foam").
+
 - **Compass health was measured across Acro.** `analyze_compass_health()` ran over the whole
   log, so on a 417 s flight that was 211 s of aggressive Acro with loops, the "heading jitter"
   statistic was mostly the pilot's yaw stick. It reported 8.4 deg/s RMS, tripping the
