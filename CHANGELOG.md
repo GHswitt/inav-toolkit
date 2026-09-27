@@ -5,6 +5,40 @@ All notable changes to this fork, relative to the verbatim upstream import.
 Format: each entry corresponds to one commit. See `git log` for full reasoning and the
 measurements behind each change.
 
+## [2.23.6] — 2026-09-27
+
+### Fixed
+
+- **Compass health was measured across Acro.** `analyze_compass_health()` ran over the whole
+  log, so on a 417 s flight that was 211 s of aggressive Acro with loops, the "heading jitter"
+  statistic was mostly the pilot's yaw stick. It reported 8.4 deg/s RMS, tripping the
+  `> 5.0` WARNING ("check compass mounting") and scoring the compass 45/100 on a compass that
+  was fine. Heading is now measured only where the flight controller holds it: nav modes that
+  own position or course (PosHold, RTH, WP, CourseHold) unconditionally, plus Angle, Horizon
+  and AltHold while the craft is actually hovering (tilt ≤ 12°, body rates ≤ 30 deg/s).
+  AltHold is deliberately in the hover-gated tier rather than the nav tier — it holds
+  altitude only, so a banked turn in AltHold is flying, not drift. Pilot-commanded yaw
+  (|rcCommand[2]| > 20) and pre-takeoff/post-landing ground time are excluded throughout.
+  The measurement window is now reported alongside the figure in both the console and HTML
+  output, so the number can be read in context.
+
+- **Heading jitter double-counted its own quantisation.** The 1 kHz-to-50 Hz reduction picked
+  every 19th sample instead of averaging them. `attitude[2]` is logged in decidegrees, so one
+  0.1° quantiser step differentiated over a 1/50 s interval reads as **5.3 deg/s** — decimation
+  folds that alias straight into the passband, on a craft whose real hover jitter is under
+  2 deg/s. Box-averaging each block attenuates it instead. Measured over the same hover
+  windows of one log: 2.60 deg/s decimated vs 1.81 deg/s averaged, i.e. 1.87 deg/s of the
+  original figure was pure alias.
+
+- **Derivatives were taken across excluded stretches.** Masking a boolean selection and then
+  calling `np.diff` joins the two sides of every gap and reports the join as a data step.
+  `contiguous_runs()` now splits the selection into runs and statistics are pooled across
+  them, and heading drift is summed per run — heading changed while the gate was open is
+  drift, heading changed in between was the pilot turning.
+
+Net effect on one 417 s log (LOG00007, QMC5883L on a Foxeer M10Q 250): jitter 8.37 → 3.41
+deg/s, drift 1.06 → 0.38 deg/s, compass score 45 → 85, spurious mounting WARNING gone.
+
 ## [2.23.5] — 2026-09-27
 
 ### Fixed

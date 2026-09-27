@@ -2978,6 +2978,131 @@ def rate_mode_mask(data):
     return (modes & FM_SELF_LEVEL_MASK) == 0
 
 
+# Modes in which the flight controller owns the craft's position or course, so
+# the airframe is not being flown around by hand and heading movement is either
+# real drift or sensor noise. Acro is deliberately absent: there the pilot
+# commands yaw rate directly and any "jitter" measured is the pilot's stick.
+FM_HEADING_HELD_MASK = ((1 << FM_NAV_POSHOLD) | (1 << FM_NAV_RTH) |
+                        (1 << FM_NAV_WP) | (1 << FM_NAV_COURSE_HOLD))
+
+# Modes that level the craft but leave it to the pilot to fly. AltHold belongs
+# here, not above: it holds *altitude* only, so the pilot still banks and turns
+# and the airframe yaws through coordinated turns just as it does in Angle.
+# These count only while the craft is actually hovering.
+FM_HOVER_GATED_MASK = FM_SELF_LEVEL_MASK | (1 << FM_NAV_ALTHOLD)
+
+COMPASS_HOVER_MAX_TILT_DEG = 12.0
+COMPASS_HOVER_MAX_GYRO_DPS = 30.0
+# Stick deflection (rcCommand units, +-500) above which yaw is pilot-commanded.
+COMPASS_YAW_STICK_DEADBAND = 20.0
+# Shorter runs than this cannot support a derivative statistic.
+COMPASS_MIN_RUN_S = 3.0
+# Below this much eligible time, fall back to the whole log rather than report
+# a jitter figure from a few seconds of hover.
+COMPASS_MIN_TOTAL_S = 10.0
+
+
+def contiguous_runs(mask, sr, min_seconds):
+    """[(start, end), ...] for each run of True in `mask` lasting >= min_seconds.
+
+    Derivative statistics must not be taken across a gap: np.diff over a
+    boolean-indexed array silently joins the two sides of every excluded stretch
+    and reports the join as a data step."""
+    if mask is None or not np.any(mask):
+        return []
+    m = np.asarray(mask, dtype=bool).astype(np.int8)
+    edges = np.diff(m)
+    starts = list(np.flatnonzero(edges == 1) + 1)
+    ends = list(np.flatnonzero(edges == -1) + 1)
+    if m[0]:
+        starts.insert(0, 0)
+    if m[-1]:
+        ends.append(len(m))
+    need = max(2, int(min_seconds * sr))
+    return [(int(a), int(b)) for a, b in zip(starts, ends) if b - a >= need]
+
+
+def compass_steady_mask(data, sr):
+    """(mask, label) selecting the samples where heading should be holding still.
+
+    Nav modes always qualify; Angle qualifies only while hovering; Acro never
+    does. Ground time and pilot-commanded yaw are excluded throughout. Returns
+    (None, reason) when the log cannot support the selection, so the caller can
+    fall back to the whole log.
+    """
+    n = data.get("n_rows") or len(data.get("time_s", []))
+    if not n:
+        return None, "no samples"
+
+    modes = data.get("active_modes")
+    if modes is None or len(modes) != n:
+        return None, "log has no flight-mode data"
+
+    held = (modes & FM_HEADING_HELD_MASK) != 0
+    leveled = (modes & FM_HOVER_GATED_MASK) != 0
+
+    hovering = np.ones(n, dtype=bool)
+    for key in ("att_roll", "att_pitch"):
+        tilt = data.get(key)
+        if tilt is not None and len(tilt) == n:
+            # attitude[] is logged in decidegrees
+            hovering &= np.abs(np.nan_to_num(np.asarray(tilt, dtype=float)) / 10.0) \
+                <= COMPASS_HOVER_MAX_TILT_DEG
+    for key in ("gyro_roll", "gyro_pitch", "gyro_yaw"):
+        gy = data.get(key)
+        if gy is not None and len(gy) == n:
+            hovering &= np.abs(np.nan_to_num(np.asarray(gy, dtype=float))) \
+                <= COMPASS_HOVER_MAX_GYRO_DPS
+
+    eligible = held | (leveled & hovering)
+
+    # A yaw stick input is a commanded heading change, not jitter or drift.
+    yaw_stick = data.get("setpoint_yaw")
+    if yaw_stick is not None and len(yaw_stick) == n:
+        eligible &= np.abs(np.nan_to_num(np.asarray(yaw_stick, dtype=float))) \
+            <= COMPASS_YAW_STICK_DEADBAND
+
+    # Props turning on the ground is not flight, and the pad can shake.
+    span = find_airborne_span(data, sr)
+    if span:
+        air = np.zeros(n, dtype=bool)
+        air[span[0]:span[1]] = True
+        eligible &= air
+
+    if float(np.sum(eligible)) / sr < COMPASS_MIN_TOTAL_S:
+        return None, "under %.0fs of steady nav/hover flight" % COMPASS_MIN_TOTAL_S
+
+    held_s = float(np.sum(eligible & held)) / sr
+    hov_s = float(np.sum(eligible & ~held)) / sr
+    label = "%.0fs nav hold" % held_s if held_s >= 1 else ""
+    if hov_s >= 1:
+        label = (label + " + " if label else "") + "%.0fs leveled hover" % hov_s
+    return eligible, label or "%.0fs steady flight" % (float(np.sum(eligible)) / sr)
+
+
+def heading_rate_series(hdg_deg, runs, sr, target_hz=50.0):
+    """Heading rate (deg/s) pooled over `runs`, plus the decimation factor used.
+
+    Averages each block of samples instead of picking one out of each. att_heading
+    is logged in decidegrees at up to 1 kHz, so one 0.1 deg quantisation step
+    differentiated over a 1/50 s decimation interval reads as 5 deg/s -- enough to
+    dominate the statistic on a craft whose real hover jitter is under 2 deg/s.
+    Averaging attenuates that alias instead of folding it into the passband.
+    """
+    ds = max(1, int(round(sr / target_hz)))
+    sr_ds = sr / ds
+    out = []
+    for a, b in runs:
+        seg = np.asarray(hdg_deg[a:b], dtype=float)
+        seg = np.nan_to_num(seg, nan=float(np.nanmean(seg)) if np.any(~np.isnan(seg)) else 0.0)
+        m = (len(seg) // ds) * ds
+        if m < 2 * ds:
+            continue
+        blocks = np.unwrap(np.deg2rad(seg[:m])).reshape(-1, ds).mean(axis=1)
+        out.append(np.rad2deg(np.diff(blocks)) * sr_ds)
+    return (np.concatenate(out) if out else np.array([])), ds
+
+
 def flight_mode_breakdown(data, sr):
     """Seconds spent in Acro / Angle / AltHold / PosHold / RTH, for reporting."""
     modes = data.get("active_modes")
@@ -3817,63 +3942,70 @@ def analyze_compass_health(data, sr):
     - Motor/throttle EMI correlation
     - Heading drift rate
 
-    Works on ANY flight mode - doesn't need poshold.
+    Measured only where the flight controller is holding heading: every nav mode,
+    plus Angle while hovering. Acro is excluded -- there yaw rate is whatever the
+    pilot's stick asks for, so a jitter figure taken across it measures flying, not
+    the compass. Falls back to the whole log when the log carries no mode data.
     """
     results = {
         "score": None,
         "heading_jitter_deg": None,
         "throttle_correlation": None,
         "heading_drift_dps": None,
+        "window": None,
+        "window_seconds": None,
         "findings": []
     }
 
     if "att_heading" not in data:
         return results
 
-    heading = data["att_heading"]
-    valid = ~np.isnan(heading)
-    if np.sum(valid) < sr * 5:  # need at least 5 seconds
+    n = data.get("n_rows") or len(data["att_heading"])
+    heading = np.asarray(data["att_heading"], dtype=float)
+    finite = ~np.isnan(heading)
+    if np.sum(finite) < sr * 5:  # need at least 5 seconds
         return results
 
-    hdg = heading[valid] / 10.0  # decidegrees to degrees
+    hdg = heading / 10.0  # decidegrees to degrees
+
+    steady, label = compass_steady_mask(data, sr)
+    if steady is None:
+        steady = finite
+        label = "whole log (%s)" % label
+    else:
+        steady = steady & finite
+
+    runs = contiguous_runs(steady, sr, COMPASS_MIN_RUN_S)
+    if not runs:
+        return results
+    window_s = sum(b - a for a, b in runs) / sr
+    results["window"] = label
+    results["window_seconds"] = round(window_s, 1)
 
     # ─── Heading jitter: std dev of heading derivative ───
-    # Compass updates at ~75Hz but log rate can be 1000Hz.
-    # Downsample to ~50Hz to avoid quantization noise from identical samples.
-    ds_factor = max(1, int(sr / 50))
-    hdg_ds = hdg[::ds_factor]
+    hdg_rate_deg, ds_factor = heading_rate_series(hdg, runs, sr)
     sr_ds = sr / ds_factor
-
-    # Unwrap heading to handle 0/360 wraparound
-    hdg_unwrap = np.unwrap(np.deg2rad(hdg_ds))
-    hdg_rate = np.diff(hdg_unwrap) * sr_ds  # rad/s
-    hdg_rate_deg = np.rad2deg(hdg_rate)
-
-    # Filter out large intentional turns (>30 deg/s)
-    steady_mask = np.abs(hdg_rate_deg) < 30
-    if np.sum(steady_mask) < sr_ds * 2:
+    if len(hdg_rate_deg) < 2 * sr_ds:
         return results
 
-    jitter = float(np.std(hdg_rate_deg[steady_mask]))
+    # Anything this fast is a real turn that slipped past the mode gate.
+    steady_rate = np.abs(hdg_rate_deg) < 30
+    if np.sum(steady_rate) < sr_ds * 2:
+        return results
+
+    jitter = float(np.std(hdg_rate_deg[steady_rate]))
     results["heading_jitter_deg"] = round(jitter, 2)
 
     # ─── Motor correlation: does heading jump when throttle changes? ───
-    throttle = None
-    if "throttle" in data:
-        throttle = data["throttle"][valid][::ds_factor]
-    elif "motor0" in data:
-        throttle = data["motor0"][valid][::ds_factor]
-
-    if throttle is not None and len(throttle) > 100:
-        # Compute throttle rate of change
-        thr_rate = np.diff(throttle)
-        # Align lengths
+    thr_src = "throttle" if "throttle" in data else ("motor0" if "motor0" in data else None)
+    if thr_src is not None and len(data[thr_src]) == n:
+        thr_rate, _ = heading_rate_series(np.asarray(data[thr_src], dtype=float),
+                                          runs, sr)
         min_len = min(len(hdg_rate_deg), len(thr_rate))
         if min_len > 100:
             h = hdg_rate_deg[:min_len]
             t = thr_rate[:min_len]
             # Absolute correlation - we care about magnitude, not direction
-            # Use sliding windows to catch delayed correlation
             try:
                 corr = abs(float(np.corrcoef(np.abs(h), np.abs(t))[0, 1]))
                 if not np.isnan(corr):
@@ -3881,12 +4013,19 @@ def analyze_compass_health(data, sr):
             except (ValueError, FloatingPointError):
                 pass
 
-    # ─── Heading drift: average rate over the whole flight ───
-    duration_s = len(hdg_ds) / sr_ds
-    if duration_s > 10:
-        total_drift = hdg_unwrap[-1] - hdg_unwrap[0]
-        drift_dps = float(np.rad2deg(total_drift) / duration_s)
-        results["heading_drift_dps"] = round(drift_dps, 3)
+    # ─── Heading drift: net heading movement per second held ───
+    # Summed across runs rather than endpoint-to-endpoint over the log: heading
+    # changed while the gate was open is drift, heading changed in between was the
+    # pilot turning.
+    if window_s > 10:
+        total = 0.0
+        held = 0.0
+        for a, b in runs:
+            seg = np.unwrap(np.deg2rad(np.nan_to_num(hdg[a:b])))
+            total += float(np.rad2deg(seg[-1] - seg[0]))
+            held += (b - a) / sr
+        if held > 0:
+            results["heading_drift_dps"] = round(total / held, 3)
 
     # ─── Scoring ───
     score = 100
@@ -3895,10 +4034,12 @@ def analyze_compass_health(data, sr):
     if jitter > 5.0:
         score -= 40
         findings.append(("WARNING", f"High heading jitter: {jitter:.1f} deg/s RMS "
+                         f"over {label} "
                          "(expect <2 deg/s in calm hover, check compass mounting)"))
     elif jitter > 2.0:
         score -= 15
-        findings.append(("INFO", f"Moderate heading jitter: {jitter:.1f} deg/s RMS"))
+        findings.append(("INFO", f"Moderate heading jitter: {jitter:.1f} deg/s RMS "
+                         f"over {label}"))
 
     corr = results["throttle_correlation"]
     if corr is not None and corr > 0.4:
@@ -5116,6 +5257,8 @@ def format_nav_report(nav_results, use_color=True):
                     detail_parts.append(f"jitter {r['heading_jitter_deg']:.1f} deg/s")
                 if r.get("throttle_correlation") is not None:
                     detail_parts.append(f"motor corr {r['throttle_correlation']:.2f}")
+                if r.get("window"):
+                    detail_parts.append(f"over {r['window']}")
             elif key == "gps":
                 if r.get("avg_sats") is not None:
                     detail_parts.append(f"{r['avg_sats']:.0f} sats avg")
@@ -5173,6 +5316,8 @@ def generate_nav_html_section(nav_results):
             if key == "compass":
                 if r.get("heading_jitter_deg") is not None:
                     details.append(f"Jitter: {r['heading_jitter_deg']:.1f} deg/s")
+                if r.get("window"):
+                    details.append(f"measured over {r['window']}")
                 if r.get("throttle_correlation") is not None:
                     details.append(f"Motor correlation: {r['throttle_correlation']:.2f}")
             elif key == "gps":
@@ -7927,6 +8072,8 @@ def _generate_nav_only_html(nav_results, config, data):
             if key == "compass":
                 if r.get("heading_jitter_deg") is not None:
                     details.append(f"Jitter: {r['heading_jitter_deg']:.1f} deg/s")
+                if r.get("window"):
+                    details.append(f"measured over {r['window']}")
                 if r.get("throttle_correlation") is not None:
                     details.append(f"Motor corr: {r['throttle_correlation']:.2f}")
                 if r.get("heading_drift_dps") is not None:

@@ -1498,3 +1498,114 @@ class TestAirborneSpan:
         assert len(out["baro_alt"]) == 2000
         assert out["_slow_frames"] is data["_slow_frames"]   # aux frames untouched
         assert len(data["baro_alt"]) == int(69 * sr)          # original unchanged
+
+
+class TestCompassWindow:
+    """Compass health is measured where the FC holds heading, not across Acro."""
+
+    SR = 1000.0
+
+    def _log(self, n, modes, heading, **extra):
+        from inav_toolkit.blackbox_analyzer import FM_ANGLE, FM_NAV_POSHOLD
+        data = {
+            "n_rows": n,
+            "time_s": np.arange(n) / self.SR,
+            "att_heading": np.asarray(heading, dtype=float),
+            "att_roll": np.zeros(n),
+            "att_pitch": np.zeros(n),
+            "gyro_roll": np.zeros(n),
+            "gyro_pitch": np.zeros(n),
+            "gyro_yaw": np.zeros(n),
+            "setpoint_yaw": np.zeros(n),
+            "active_modes": np.asarray(modes, dtype=np.int64),
+            "motor0": np.full(n, 1500.0), "motor1": np.full(n, 1500.0),
+            "motor2": np.full(n, 1500.0), "motor3": np.full(n, 1500.0),
+        }
+        data.update(extra)
+        return data
+
+    def test_contiguous_runs_splits_on_gaps(self):
+        from inav_toolkit.blackbox_analyzer import contiguous_runs
+        mask = np.zeros(1000, dtype=bool)
+        mask[0:300] = True
+        mask[400:900] = True
+        runs = contiguous_runs(mask, 100.0, 1.0)  # >= 100 samples
+        assert runs == [(0, 300), (400, 900)]
+
+    def test_contiguous_runs_drops_short_ones(self):
+        from inav_toolkit.blackbox_analyzer import contiguous_runs
+        mask = np.zeros(1000, dtype=bool)
+        mask[10:20] = True        # too short
+        mask[100:900] = True
+        assert contiguous_runs(mask, 100.0, 1.0) == [(100, 900)]
+
+    def test_acro_is_excluded_from_the_window(self):
+        from inav_toolkit.blackbox_analyzer import compass_steady_mask, FM_NAV_POSHOLD
+        n = 40000
+        modes = np.zeros(n, dtype=np.int64)          # first half Acro (no bits)
+        modes[n // 2:] = 1 << FM_NAV_POSHOLD
+        mask, label = compass_steady_mask(self._log(n, modes, np.zeros(n)), self.SR)
+        assert mask is not None
+        assert not mask[: n // 2].any()
+        assert mask[n // 2:].all()
+        assert "nav hold" in label
+
+    def test_althold_needs_hover_not_just_the_mode(self):
+        """AltHold holds altitude only -- a banked turn in it is flying, not drift."""
+        from inav_toolkit.blackbox_analyzer import (compass_steady_mask,
+                                                    FM_NAV_ALTHOLD, FM_ANGLE)
+        n = 40000
+        modes = np.full(n, (1 << FM_NAV_ALTHOLD) | (1 << FM_ANGLE), dtype=np.int64)
+        d = self._log(n, modes, np.zeros(n))
+        d["att_roll"] = np.zeros(n)
+        d["att_roll"][: n // 2] = 350.0   # 35 deg of bank, in decidegrees
+        mask, _ = compass_steady_mask(d, self.SR)
+        assert mask is not None
+        assert not mask[: n // 2].any()
+        assert mask[n // 2:].all()
+
+    def test_commanded_yaw_is_not_jitter(self):
+        from inav_toolkit.blackbox_analyzer import compass_steady_mask, FM_NAV_POSHOLD
+        n = 40000
+        modes = np.full(n, 1 << FM_NAV_POSHOLD, dtype=np.int64)
+        d = self._log(n, modes, np.zeros(n))
+        d["setpoint_yaw"][: n // 2] = 200.0
+        mask, _ = compass_steady_mask(d, self.SR)
+        assert mask is not None
+        assert not mask[: n // 2].any()
+
+    def test_averaging_beats_decimation_on_quantised_heading(self):
+        """0.1 deg LSB differentiated over 1/50 s is 5 deg/s of pure alias."""
+        from inav_toolkit.blackbox_analyzer import heading_rate_series
+        n = 40000
+        # A heading genuinely holding still, logged in decidegrees: the only
+        # movement is the quantiser dithering between two adjacent codes.
+        rng = np.random.default_rng(7)
+        hdg = np.round(1000 + rng.normal(0, 0.4, n)) / 10.0
+        rate, ds = heading_rate_series(hdg, [(0, n)], self.SR)
+        assert ds == 20
+        decimated = np.diff(np.unwrap(np.deg2rad(hdg[::ds]))) * (self.SR / ds)
+        assert np.std(rate) < np.std(np.rad2deg(decimated)) / 2
+
+    def test_no_mode_data_falls_back_to_whole_log(self):
+        from inav_toolkit.blackbox_analyzer import analyze_compass_health
+        n = 40000
+        d = self._log(n, np.zeros(n), np.zeros(n))
+        del d["active_modes"]
+        r = analyze_compass_health(d, self.SR)
+        assert r["heading_jitter_deg"] is not None
+        assert "whole log" in r["window"]
+
+    def test_drift_is_measured_only_while_the_gate_is_open(self):
+        """Heading turned between two holds must not be charged as drift."""
+        from inav_toolkit.blackbox_analyzer import analyze_compass_health, FM_NAV_POSHOLD
+        n = 60000
+        modes = np.zeros(n, dtype=np.int64)
+        modes[:20000] = 1 << FM_NAV_POSHOLD
+        modes[40000:] = 1 << FM_NAV_POSHOLD          # Acro turn in between
+        hdg = np.zeros(n)
+        hdg[20000:40000] = np.linspace(0, 900, 20000)  # 90 deg turn, decidegrees
+        hdg[40000:] = 900.0
+        r = analyze_compass_health(self._log(n, modes, hdg), self.SR)
+        assert r["heading_drift_dps"] is not None
+        assert abs(r["heading_drift_dps"]) < 0.01
