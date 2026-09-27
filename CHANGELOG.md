@@ -5,6 +5,19 @@ All notable changes to this fork, relative to the verbatim upstream import.
 Format: each entry corresponds to one commit. See `git log` for full reasoning and the
 measurements behind each change.
 
+## [2.23.5] — 2026-09-27
+
+### Fixed
+
+- **Deceleration overshoot was measured outside nav modes.** The position-hold, altitude-hold
+  and velocity-controller sections of `analyze_nav_performance()` mask to the relevant mode;
+  the deceleration section did not. Outside nav control `navTgtPos` is stale, so the
+  "position error" is just distance flown since. On a log that was 83 % Acro this produced an
+  average overshoot of 6744 cm, a worst case of 26762 cm — from an Acro pass at 22.7 m/s —
+  and a recommendation to reduce `nav_mc_vel_xy_p` from 40 to 28. After the fix the same log
+  reports 72 cm average, 131 cm worst, no recommendation, and the nav score rises from 50 to
+  80. Events are also discarded if the craft leaves nav control during the settling window.
+
 ## [2.23.4] — 2026-09-26
 
 ### Fixed

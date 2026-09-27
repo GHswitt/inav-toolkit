@@ -20,7 +20,7 @@ import re
 import sys
 import textwrap
 
-VERSION = "2.23.4"
+VERSION = "2.23.5"
 
 
 def _enable_ansi_colors():
