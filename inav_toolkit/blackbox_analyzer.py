@@ -104,7 +104,7 @@ def _disable_colors():
 AXIS_NAMES = ["Roll", "Pitch", "Yaw"]
 AXIS_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D"]
 MOTOR_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D", "#A78BFA"]
-REPORT_VERSION = "2.23.9"
+REPORT_VERSION = "2.23.10"
 
 # ─── Frame and Prop Profiles ─────────────────────────────────────────────────
 # Two separate concerns:
@@ -4854,6 +4854,77 @@ def orbit_test(err_n, err_e, sr, smooth_s=0.5):
     }
 
 
+# A hold that varies between segments is telling you something the best segment
+# alone does not. Flag it when the spread is this large.
+POSHOLD_SPREAD_RATIO = 2.0
+
+
+def analyze_position_hold_segments(data, sr, held):
+    """Position hold across every held segment, not only the longest.
+
+    Reporting the longest segment alone hid a real spread on one log: its four
+    segments measured CEP 31.9, 98.2, 181.1 and 64.7 cm, and only the 31.9 cm
+    figure was ever shown. That made a position loop with metre-scale excursions
+    look like it held to a foot, and it hid a consistent 0.09-0.21 Hz oscillation
+    that is exactly the symptom a "position P too high" warning describes.
+
+    The headline `cep_cm` is the worst segment, not the best or the longest: a
+    hold is only as good as its poorest showing, and an optimistic headline is
+    what caused the problem. Per-segment detail is kept in `segments_detail`.
+    """
+    per = []
+    for a, b, st in held:
+        r = analyze_position_hold(data, sr, a, b)
+        if r.get("cep_cm") is None:
+            continue
+        r["start_s"] = round(float(a) / sr, 1)
+        r["duration_s"] = round((b - a) / sr, 1)
+        r["nav_state"] = int(st)
+        per.append(r)
+
+    if not per:
+        # Nothing measurable: return the longest segment's result so its
+        # explanation (stale target, too little settled hold) still reaches the user.
+        longest = max(held, key=lambda p: p[1] - p[0])
+        out = analyze_position_hold(data, sr, longest[0], longest[1])
+        out["segments"] = len(held)
+        return out
+
+    worst = max(per, key=lambda r: r["cep_cm"])
+    best = min(per, key=lambda r: r["cep_cm"])
+    total_s = sum(r["duration_s"] for r in per)
+
+    out = dict(worst)
+    out["findings"] = list(worst.get("findings") or [])
+    out["segments"] = len(per)
+    out["segments_total_s"] = round(total_s, 1)
+    out["analyzed_s"] = worst["duration_s"]
+    out["worst_cep_cm"] = worst["cep_cm"]
+    out["best_cep_cm"] = best["cep_cm"]
+    out["toilet_bowl"] = any(r.get("toilet_bowl") for r in per)
+    out["segments_detail"] = [
+        {k: r.get(k) for k in ("start_s", "duration_s", "nav_state", "cep_cm",
+                               "drift_p95_cm", "max_drift_cm", "toilet_bowl")}
+        for r in per]
+
+    if len(per) > 1:
+        out["findings"].insert(0, ("INFO",
+            "Position hold measured over %d segments, %.0fs total; CEP worst %.0fcm, "
+            "best %.0fcm (headline is the worst). Per segment: %s"
+            % (len(per), total_s, worst["cep_cm"], best["cep_cm"],
+               ", ".join(f"{r['duration_s']:.0f}s@{r['cep_cm']:.0f}cm" for r in per))))
+        if best["cep_cm"] > 0 and worst["cep_cm"] / best["cep_cm"] >= POSHOLD_SPREAD_RATIO:
+            out["findings"].append(("INFO",
+                "Hold quality varies %.1fx between segments (%.0f-%.0fcm) - compare "
+                "wind and stick activity before treating this as a tuning problem"
+                % (worst["cep_cm"] / best["cep_cm"], best["cep_cm"], worst["cep_cm"])))
+    else:
+        out["findings"].insert(0, ("INFO",
+            "Position hold measured over %.0fs (1 held segment, navState %d)"
+            % (total_s, per[0]["nav_state"])))
+    return out
+
+
 def analyze_position_hold(data, sr, phase_start=None, phase_end=None):
     """Analyze position hold performance.
 
@@ -5619,21 +5690,11 @@ def run_nav_analysis(data, sr, config=None):
         best_alt = max(nav_phases, key=lambda p: p[1] - p[0])
         results["althold"] = analyze_altitude_hold(data, sr, best_alt[0], best_alt[1])
         if held:
-            best = max(held, key=lambda p: p[1] - p[0])
-            results["poshold"] = analyze_position_hold(data, sr, best[0], best[1])
-            results["poshold"]["nav_state"] = int(best[2])
-            results["poshold"]["segments"] = len(held)
-            results["poshold"]["segments_total_s"] = round(
-                sum(b - a for a, b, _ in held) / sr, 1)
-            results["poshold"]["analyzed_s"] = round((best[1] - best[0]) / sr, 1)
-            # Provenance: which span the figures came from. Without this the
-            # numbers look like they describe the whole flight.
-            if results["poshold"].get("cep_cm") is not None:
-                results["poshold"]["findings"].insert(0, ("INFO",
-                    f"Position hold measured over {(best[1]-best[0])/sr:.0f}s "
-                    f"(longest of {len(held)} held segment(s), "
-                    f"{sum(b-a for a,b,_ in held)/sr:.0f}s total, navState "
-                    f"{int(best[2])})"))
+            # Every held segment, not just the longest. Reporting only the longest
+            # hid a real spread: one log's segments measured CEP 31.9, 98.2, 181.1
+            # and 64.7 cm, and only the 31.9 cm one was ever shown -- which made a
+            # position loop with 1 m excursions look like it held to a foot.
+            results["poshold"] = analyze_position_hold_segments(data, sr, held)
 
     # ─── Overall nav score ───
     scores = []

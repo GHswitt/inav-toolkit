@@ -5,6 +5,36 @@ All notable changes to this fork, relative to the verbatim upstream import.
 Format: each entry corresponds to one commit. See `git log` for full reasoning and the
 measurements behind each change.
 
+## [2.23.10] — 2026-09-27
+
+### Fixed
+
+- **Position hold reported only its longest segment.** 2.23.7 fixed *which* phase was analysed
+  but still collapsed the result to a single span, and the headline was the longest one. On one
+  log that meant reporting **CEP 31.9 cm** while the same flight also held at **98.2 cm**, and
+  another flight at **181.1 cm** and 64.7 cm — so a position loop with metre-scale excursions
+  read as holding to a foot. It also hid a consistent **0.09–0.21 Hz** oscillation in the
+  position error (27–60 % of the 0.05–2 Hz band), which is precisely the symptom a
+  "`nav_mc_pos_xy_p` too high" warning describes, and which had therefore been dismissed as
+  contradicted by the data.
+
+  `analyze_position_hold_segments()` now measures every held segment. The headline `cep_cm` is
+  the **worst** segment, not the longest or the best: a hold is only as good as its poorest
+  showing, and an optimistic headline is what caused the misreading. `worst_cep_cm`,
+  `best_cep_cm` and a per-segment `segments_detail` (start, duration, navState, CEP, p95, max,
+  bowl) are reported alongside, `toilet_bowl` is true if **any** segment shows one, and the
+  segments are listed inline in a finding (`40s@32cm, 31s@98cm`).
+
+  When segments disagree by ≥2× the spread is called out explicitly, with the advice to compare
+  wind and stick activity before treating it as a tuning problem — a hold that varies 3× between
+  segments is more likely conditions than gains, and the point of this change is an honest
+  figure, not a pessimistic one.
+
+### Known
+
+- Nav scoring still penalises only above CEP 200 cm, so a 181 cm hold scores 100/100. Left
+  unchanged for the same reason as the noise score: scores are recorded per flight downstream.
+
 ## [2.23.9] — 2026-09-27
 
 ### Fixed

@@ -2072,3 +2072,77 @@ class TestAccelVibrationScaling:
              "acc_z": np.ones(n) * 2048.0}
         r = analyze_accel_vibration(d, self.SR)
         assert any("higher than the other" in f["text"] for f in r["findings"])
+
+
+NAV_IDLE = 1
+NAV_POSHOLD = 7
+
+
+class TestPosHoldSegments:
+    """A hold is only as good as its poorest segment."""
+
+    SR = 1000.0
+
+    def _log(self, ceps_cm, seg_s=40.0, gap_s=20.0):
+        """Build a log with one held segment per requested CEP."""
+        segs, held, pos_n, pos_e, tgt_n, tgt_e, states = [], [], [], [], [], [], []
+        rng = np.random.default_rng(4)
+        idx = 0
+        for cep in ceps_cm:
+            g = int(gap_s * self.SR)
+            pos_n.append(np.full(g, 1000.0)); pos_e.append(np.full(g, 2000.0))
+            tgt_n.append(np.zeros(g)); tgt_e.append(np.zeros(g))
+            states.append(np.full(g, NAV_IDLE))
+            idx += g
+            n = int(seg_s * self.SR)
+            sigma = cep / 1.1774        # CEP50 of a 2-D Gaussian
+            pos_n.append(1000.0 + rng.normal(0, sigma, n))
+            pos_e.append(2000.0 + rng.normal(0, sigma, n))
+            tgt_n.append(np.full(n, 1000.0)); tgt_e.append(np.full(n, 2000.0))
+            states.append(np.full(n, NAV_POSHOLD))
+            held.append((idx, idx + n, NAV_POSHOLD))
+            idx += n
+        cat = lambda xs: np.concatenate(xs)
+        n_tot = idx
+        return {
+            "n_rows": n_tot, "time_s": np.arange(n_tot) / self.SR,
+            "nav_pos_n": cat(pos_n), "nav_pos_e": cat(pos_e),
+            "nav_tgt_n": cat(tgt_n), "nav_tgt_e": cat(tgt_e),
+        }, held
+
+    def test_headline_is_the_worst_segment_not_the_longest(self):
+        from inav_toolkit.blackbox_analyzer import analyze_position_hold_segments
+        d, held = self._log([30.0, 180.0])
+        r = analyze_position_hold_segments(d, self.SR, held)
+        assert r["worst_cep_cm"] > 100
+        assert r["best_cep_cm"] < 60
+        assert r["cep_cm"] == r["worst_cep_cm"]
+
+    def test_every_segment_is_reported(self):
+        from inav_toolkit.blackbox_analyzer import analyze_position_hold_segments
+        d, held = self._log([30.0, 100.0, 180.0])
+        r = analyze_position_hold_segments(d, self.SR, held)
+        assert r["segments"] == 3
+        assert len(r["segments_detail"]) == 3
+        assert all(s["cep_cm"] is not None for s in r["segments_detail"])
+        msg = [m for lvl, m in r["findings"] if "segments" in m][0]
+        assert "worst" in msg and "best" in msg
+
+    def test_large_spread_is_flagged(self):
+        from inav_toolkit.blackbox_analyzer import analyze_position_hold_segments
+        d, held = self._log([30.0, 180.0])
+        r = analyze_position_hold_segments(d, self.SR, held)
+        assert any("varies" in m for lvl, m in r["findings"])
+
+    def test_consistent_segments_are_not_flagged(self):
+        from inav_toolkit.blackbox_analyzer import analyze_position_hold_segments
+        d, held = self._log([40.0, 45.0])
+        r = analyze_position_hold_segments(d, self.SR, held)
+        assert not any("varies" in m for lvl, m in r["findings"])
+
+    def test_single_segment_still_reports_provenance(self):
+        from inav_toolkit.blackbox_analyzer import analyze_position_hold_segments
+        d, held = self._log([40.0])
+        r = analyze_position_hold_segments(d, self.SR, held)
+        assert r["segments"] == 1
+        assert any("1 held segment" in m for lvl, m in r["findings"])
