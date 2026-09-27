@@ -104,7 +104,7 @@ def _disable_colors():
 AXIS_NAMES = ["Roll", "Pitch", "Yaw"]
 AXIS_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D"]
 MOTOR_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D", "#A78BFA"]
-REPORT_VERSION = "2.23.10"
+REPORT_VERSION = "2.23.11"
 
 # ─── Frame and Prop Profiles ─────────────────────────────────────────────────
 # Two separate concerns:
@@ -1779,10 +1779,18 @@ def decode_blackbox_native(filepath, raw_params, quiet=False):
         data["_acc_1g"] = ACC_1G_DEFAULT
     if data["_acc_1g"] <= 0:
         data["_acc_1g"] = ACC_1G_DEFAULT
-    try:
-        data["_acc_lpf_hz"] = float(raw_params.get("acc_lpf_hz", 0) or 0)
-    except (TypeError, ValueError):
-        data["_acc_lpf_hz"] = 0.0
+    # Absent means UNKNOWN, not "no filter". Treating a missing header field as 0
+    # claimed full accelerometer bandwidth for a log whose header was simply
+    # truncated (LOG00005: 47 header lines, no sentinel), and a vibration verdict
+    # was then produced from data that may have been lowpassed at 15 Hz.
+    _lpf = raw_params.get("acc_lpf_hz")
+    if _lpf is None or str(_lpf).strip() == "":
+        data["_acc_lpf_hz"] = None
+    else:
+        try:
+            data["_acc_lpf_hz"] = float(_lpf)
+        except (TypeError, ValueError):
+            data["_acc_lpf_hz"] = None
 
     # Reject physically impossible samples before any metric sees them. Done here,
     # once, so every downstream analysis inherits it rather than each having to
@@ -3611,10 +3619,17 @@ def analyze_accel_vibration(data, sr, prop_harmonics=None):
     score = 100
     acc_1g = float(data.get("_acc_1g") or ACC_1G_DEFAULT)
     results["acc_1g"] = acc_1g
-    acc_lpf_hz = float(data.get("_acc_lpf_hz") or 0.0)
+    acc_lpf_hz = data.get("_acc_lpf_hz")
     results["acc_lpf_hz"] = acc_lpf_hz
-    # Whether the logged accel can support a vibration verdict at all.
-    band_limited = 0.0 < acc_lpf_hz < ACC_LPF_TRUSTWORTHY_HZ
+    # Whether the logged accel can support a vibration verdict at all. Unknown is
+    # not the same as unfiltered: with the cutoff unknown we cannot claim the
+    # bandwidth needed, so we decline rather than guess.
+    if acc_lpf_hz is None:
+        band_limited = True
+        results["acc_lpf_unknown"] = True
+    else:
+        band_limited = 0.0 < float(acc_lpf_hz) < ACC_LPF_TRUSTWORTHY_HZ
+        results["acc_lpf_unknown"] = False
     results["band_limited"] = band_limited
 
     for axis_name, key in _ACCEL_AXIS_MAP.items():
@@ -3774,8 +3789,11 @@ def analyze_accel_vibration(data, sr, prop_harmonics=None):
     elif band_limited:
         results["findings"].append({
             "level": "INFO",
-            "text": f"Vibration not assessed: accSmooth is lowpassed at "
-                    f"{acc_lpf_hz:.0f}Hz and this log has no accVib field",
+            "text": ("Vibration not assessed: accelerometer lowpass is unknown "
+                     "(header incomplete) and this log has no accVib field"
+                     if acc_lpf_hz is None else
+                     f"Vibration not assessed: accSmooth is lowpassed at "
+                     f"{float(acc_lpf_hz):.0f}Hz and this log has no accVib field"),
             "detail": "The logged accelerometer signal has no content at prop "
                       "frequencies, so a vibration figure from it would measure the "
                       "filter, not the airframe. Enable the accVib blackbox field, or "

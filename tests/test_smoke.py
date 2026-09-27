@@ -1951,7 +1951,9 @@ class TestAccelVibrationScaling:
         if vib_g:
             z = z + vib_g * acc_1g * np.sqrt(2) * np.sin(2*np.pi*120*t)
         return {
-            "n_rows": n, "time_s": t, "_acc_1g": acc_1g,
+            # 0.0 is "no accel lowpass configured"; None would mean unknown, which
+            # is a different case and has its own test.
+            "n_rows": n, "time_s": t, "_acc_1g": acc_1g, "_acc_lpf_hz": 0.0,
             "acc_x": np.zeros(n), "acc_y": np.zeros(n), "acc_z": z,
         }
 
@@ -2003,6 +2005,20 @@ class TestAccelVibrationScaling:
         d["acc_vib"] = np.full(d["n_rows"], 0.25 * 2048.0)
         r = analyze_accel_vibration(d, self.SR)
         assert abs(r["fc_vib_mean_g"] - 0.25) < 0.01
+
+    def test_absent_acc_lpf_is_unknown_not_zero(self):
+        """A truncated header omits acc_lpf_hz. Treating absent as 0 claims full
+        bandwidth for data that may have been lowpassed at 15 Hz."""
+        from inav_toolkit.blackbox_analyzer import analyze_accel_vibration
+        d = self._data(vib_g=0.70)
+        d["_acc_lpf_hz"] = None
+        r = analyze_accel_vibration(d, self.SR)
+        assert r["acc_lpf_unknown"] is True
+        assert r["band_limited"] is True
+        z = [a for a in r["axes"] if a["axis"] == "Z"][0]
+        assert not any(f.get("source") in ("rms_high", "rms_moderate")
+                       for f in z["findings"])
+        assert any("unknown" in f["text"] for f in r["findings"])
 
     def test_band_limited_accel_does_not_produce_a_verdict(self):
         """accSmooth is logged after acc_lpf_hz. At 15Hz it has no content at prop

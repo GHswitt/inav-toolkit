@@ -5,6 +5,18 @@ All notable changes to this fork, relative to the verbatim upstream import.
 Format: each entry corresponds to one commit. See `git log` for full reasoning and the
 measurements behind each change.
 
+## [2.23.11] — 2026-09-28
+
+### Fixed
+
+- **An absent `acc_lpf_hz` header field was read as 0, i.e. "no filter".** Absent means
+  *unknown*. One log (LOG00005) has a **truncated header** — 47 lines, no sentinel — so the field
+  is simply missing, and 2.23.9 concluded full accelerometer bandwidth and produced a vibration
+  verdict from data that may have been lowpassed at 15 Hz. Unknown now sets `acc_lpf_unknown` and
+  is treated as band-limited, declining the verdict rather than guessing, and the finding says
+  "accelerometer lowpass is unknown (header incomplete)". A truncated header is common enough
+  (§8) that absent-vs-zero has to be distinguished explicitly.
+
 ## [2.23.10] — 2026-09-27
 
 ### Fixed
