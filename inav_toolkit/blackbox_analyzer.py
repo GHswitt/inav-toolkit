@@ -4478,7 +4478,12 @@ def analyze_nav_performance(data, sr, config=None, profile=None):
     nav_actions = []
 
     # ═══ 1. DECELERATION OVERSHOOT ═══
-    if has_tgt_vel and has_tgt:
+    # Only where a nav mode is actually flying the aircraft. Outside one, navTgtPos
+    # is stale and the "position error" is simply how far the pilot has flown since,
+    # which produced a 268 m "deceleration overshoot" from an Acro pass at 22 m/s on
+    # a real log -- and a recommendation to detune the velocity controller because
+    # of it. The other sections here already mask; this one did not.
+    if has_tgt_vel and has_tgt and np.any(any_nav_mask):
         tgt_vel_n = data["nav_tgt_vel_n"].copy()
         tgt_vel_e = data["nav_tgt_vel_e"].copy()
         pos_n = data["nav_pos_n"].copy()
@@ -4491,6 +4496,9 @@ def analyze_nav_performance(data, sr, config=None, profile=None):
         tgt_vel_e = np.nan_to_num(tgt_vel_e, 0)
 
         tgt_speed = np.sqrt(tgt_vel_n**2 + tgt_vel_e**2)  # cm/s
+        # Suppress detection outside nav modes; a stop only counts if the whole
+        # settling window is nav-controlled too (checked per event below).
+        tgt_speed = np.where(any_nav_mask, tgt_speed, 0.0)
 
         # Find deceleration events: target speed drops from >100cm/s to <30cm/s
         min_speed = 100  # cm/s = 1 m/s
@@ -4514,6 +4522,8 @@ def analyze_nav_performance(data, sr, config=None, profile=None):
                     continue  # too short to analyze
 
                 window_end = stop_idx + settle_window
+                if not np.all(any_nav_mask[stop_idx:window_end]):
+                    continue    # left nav control while settling; target goes stale
                 err_n = pos_n[stop_idx:window_end] - tgt_n[stop_idx:window_end]
                 err_e = pos_e[stop_idx:window_end] - tgt_e[stop_idx:window_end]
 
