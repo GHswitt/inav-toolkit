@@ -5,6 +5,48 @@ All notable changes to this fork, relative to the verbatim upstream import.
 Format: each entry corresponds to one commit. See `git log` for full reasoning and the
 measurements behind each change.
 
+## [2.23.13] — 2026-09-28
+
+### Fixed
+
+- **`AVERAGE_2` prediction floored instead of truncating — the root cause of the "62 Hz
+  motor/prop imbalance".** C integer division truncates toward zero; Python's `//` floors toward
+  −∞. They differ by exactly 1 whenever the sum is negative and odd, so the decoder carried a
+  systematic one-LSB bias that accumulated through each P-frame run and reset at every I-frame:
+  a sawtooth at the I-frame cadence. With `gyro_scale = 1.0` that is 1 deg/s per LSB, against the
+  1.9–2.4 deg/s peak-to-peak observed.
+
+  It affected every field using predictor 3 — `gyroADC`, `gyroRaw`, `accSmooth`, `attitude` —
+  which is why the artifact appeared with an *identical waveform on all three gyro axes*
+  (cross-axis r = 0.98) and was diagnosed as a rotating imbalance with harmonics at
+  122/184/312/375/438 Hz, all multiples of the reset cadence.
+
+  | | before | after | `orangebox` reference |
+  |---|---|---|---|
+  | LOG00002 roll p-p | — | **0.325** | 0.317 |
+  | LOG00002 pitch | — | **0.095** | 0.079 |
+  | LOG00002 yaw | — | **0.087** | 0.078 |
+  | LOG00007 roll | 1.918 | **0.434** | — |
+  | LOG00007 pitch | 2.419 | **0.362** | — |
+  | cross-axis r | 0.98 | **−0.37** | no similarity |
+
+  Our output now agrees with an independent decoder to within 0.02 deg/s, which is stronger
+  evidence than the artifact merely disappearing. 2.23.12's cadence detection correctly reports
+  `confirmed = False` and is retained as a dormant guard.
+
+  Knock-on effects: noise 20 → 23, PID 31 → 38, and the PID action changed from
+  `mc_p_pitch 53 → 66` alone to `mc_p_pitch 66` plus `mc_p_roll 57`. **Every noise and PID figure
+  produced before this release was computed with the bias present.**
+
+### Known
+
+- The **corruption episodes are unaffected** (LOG00007 still shows 208 impossible samples at
+  t=333.9 s), so they are a separate defect.
+- `STRAIGHT_LINE` prediction and the `CLAMP = 2**31` fallback remain broken for the `time` field:
+  timestamps go negative from the second sample, 42.5 % of deltas are negative, and the span reads
+  2147 s on a 417 s flight. The synthetic uniform timebase is therefore still in use. Fixing this
+  is the prerequisite for using the logged timebase.
+
 ## [2.23.12] — 2026-09-28
 
 ### Fixed

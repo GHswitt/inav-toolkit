@@ -104,7 +104,7 @@ def _disable_colors():
 AXIS_NAMES = ["Roll", "Pitch", "Yaw"]
 AXIS_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D"]
 MOTOR_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D", "#A78BFA"]
-REPORT_VERSION = "2.23.12"
+REPORT_VERSION = "2.23.13"
 
 # ─── Frame and Prop Profiles ─────────────────────────────────────────────────
 # Two separate concerns:
@@ -1259,7 +1259,18 @@ class BlackboxDecoder:
                 predicted = (2 * prev[i] - prev_prev[i]) if prev_prev else prev[i]
                 values[i] = raw[i] + predicted
             elif pred == self.PRED_AVERAGE_2:
-                predicted = ((prev[i] + prev_prev[i]) // 2) if prev_prev else prev[i]
+                # C integer division TRUNCATES toward zero; Python's // FLOORS
+                # toward -inf. They differ by 1 whenever the sum is negative and
+                # odd, so flooring introduced a systematic 1 LSB bias that
+                # accumulated through each P-frame run and reset at every I-frame
+                # -- a sawtooth at the I-frame cadence, reported as a 62.5 Hz
+                # "motor/prop imbalance" with harmonics. gyro_scale is 1.0, so one
+                # LSB is 1 deg/s against the 1.9-2.4 deg/s p-p observed.
+                if prev_prev:
+                    _sum = prev[i] + prev_prev[i]
+                    predicted = _sum // 2 if _sum >= 0 else -((-_sum) // 2)
+                else:
+                    predicted = prev[i]
                 values[i] = raw[i] + predicted
             elif pred == self.PRED_MINTHROTTLE:
                 values[i] = raw[i] + self.minthrottle

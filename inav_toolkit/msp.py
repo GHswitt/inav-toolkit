@@ -33,7 +33,7 @@ try:
 except ImportError:
     serial = None  # Checked in open()
 
-VERSION = "2.23.12"
+VERSION = "2.23.13"
 
 # ─── MSP Command IDs ─────────────────────────────────────────────────────────
 
