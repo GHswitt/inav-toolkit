@@ -1801,3 +1801,138 @@ class TestToiletBowl:
         assert r["position_discontinuity_cm"] > 4000
         msgs = [m for lvl, m in r["findings"] if "discontinuity" in m]
         assert msgs, r["findings"]
+
+
+class TestLogIntegrity:
+    """Physically impossible samples must never reach a metric."""
+
+    SR = 1000.0
+
+    def _clean(self, n=40000):
+        t = np.arange(n) / self.SR
+        rng = np.random.default_rng(3)
+        return {
+            "n_rows": n, "time_s": t,
+            "gyro_roll": 50 * np.sin(2*np.pi*3*t) + rng.normal(0, 2, n),
+            "gyro_pitch": 40 * np.cos(2*np.pi*3*t) + rng.normal(0, 2, n),
+            "gyro_yaw": 20 * np.sin(2*np.pi*2*t) + rng.normal(0, 2, n),
+            "nav_pos_n": 1000 + rng.normal(0, 20, n),
+            "nav_pos_e": 2000 + rng.normal(0, 20, n),
+            "att_heading": np.full(n, 900.0),
+        }
+
+    def test_clean_log_is_untouched(self):
+        from inav_toolkit.blackbox_analyzer import sanitize_decoded_data
+        d = self._clean()
+        before = d["gyro_roll"].copy()
+        assert sanitize_decoded_data(d, self.SR) is None
+        assert np.array_equal(d["gyro_roll"], before)
+
+    def test_impossible_gyro_is_repaired(self):
+        from inav_toolkit.blackbox_analyzer import sanitize_decoded_data
+        d = self._clean()
+        d["gyro_yaw"][20000:20015] = -5423494.0     # the real failure, 15 samples
+        rep = sanitize_decoded_data(d, self.SR)
+        assert rep is not None
+        assert rep["culprit_fields"]["gyro_yaw"] == 15
+        assert np.abs(d["gyro_yaw"]).max() < 2500
+        assert np.all(np.isfinite(d["gyro_yaw"]))    # interpolated, not NaN
+
+    def test_repair_is_cross_field(self):
+        """One bad point in the file damages several fields at once, so a field
+        that stays in range at that instant is not thereby trustworthy."""
+        from inav_toolkit.blackbox_analyzer import sanitize_decoded_data
+        d = self._clean()
+        d["gyro_yaw"][20000:20015] = -5423494.0
+        d["nav_pos_n"][20000] += 4200.0             # in range, but same instant
+        sanitize_decoded_data(d, self.SR)
+        assert abs(d["nav_pos_n"][20000] - 1000) < 200   # repaired too
+
+    def test_spectra_stay_valid_after_repair(self):
+        """compute_psd() has no NaN handling: blanking would be worse than the
+        spike it replaces."""
+        from inav_toolkit.blackbox_analyzer import sanitize_decoded_data, compute_psd
+        d = self._clean()
+        d["gyro_yaw"][20000:20015] = -5423494.0
+        sanitize_decoded_data(d, self.SR)
+        _, psd = compute_psd(d["gyro_yaw"], self.SR)
+        assert np.all(np.isfinite(psd))
+
+    def test_long_dropout_is_blanked_not_invented(self):
+        from inav_toolkit.blackbox_analyzer import sanitize_decoded_data
+        d = self._clean()
+        d["gyro_yaw"][10000:22000] = 9e6            # 12 s, beyond repair
+        rep = sanitize_decoded_data(d, self.SR)
+        assert rep["blanked_samples"] > 0
+        assert np.isnan(d["gyro_yaw"][16000])
+
+    def test_episode_is_reported_with_time_and_culprit(self):
+        from inav_toolkit.blackbox_analyzer import sanitize_decoded_data
+        d = self._clean()
+        d["gyro_yaw"][20000:20015] = -5423494.0
+        rep = sanitize_decoded_data(d, self.SR)
+        assert len(rep["episodes"]) == 1
+        assert abs(rep["episodes"][0]["start_s"] - 19.95) < 0.1
+        assert "gyro_yaw" in rep["culprit_fields"]
+
+    def test_out_of_range_heading_and_motors_caught(self):
+        from inav_toolkit.blackbox_analyzer import sanitize_decoded_data
+        d = self._clean()
+        d["att_heading"][5000] = 65535.0
+        rep = sanitize_decoded_data(d, self.SR)
+        assert "att_heading" in rep["culprit_fields"]
+
+    def test_attitude_wrap_through_inverted_is_not_corruption(self):
+        """attitude[] wraps at +-1800 decidegrees and INAV emits -1801 doing it.
+        Flagging that discards real loop data and invents a replacement."""
+        from inav_toolkit.blackbox_analyzer import sanitize_decoded_data
+        d = self._clean()
+        d["att_roll"] = np.zeros(d["n_rows"])
+        d["att_roll"][9998:10000] = [-1793.0, -1801.0]      # passing inverted
+        d["att_roll"][10000:10002] = [1791.0, 1783.0]
+        assert sanitize_decoded_data(d, self.SR) is None
+        assert d["att_roll"][9999] == -1801.0                # untouched
+
+
+class TestNoiseAmplitudeVeto:
+    """A dB figure with no reference must not drive CRITICAL on its own."""
+
+    def test_amplitude_recovered_from_psd(self):
+        """A known sinusoid's amplitude must come back out of the dB PSD."""
+        from inav_toolkit.blackbox_analyzer import compute_psd, noise_amplitude_dps
+        sr, n = 1000.0, 40000
+        t = np.arange(n) / sr
+        amp = 10.0                                  # deg/s peak -> 7.07 RMS
+        sig = amp * np.sin(2 * np.pi * 350 * t)
+        freqs, psd_db = compute_psd(sig, sr)
+        got = noise_amplitude_dps(freqs, psd_db, 300)
+        assert abs(got - amp / np.sqrt(2)) < 1.0
+
+    def test_quiet_peak_does_not_get_severity_language(self):
+        from inav_toolkit.blackbox_analyzer import _noise_remedy
+        loud = _noise_remedy("prop_harmonics", 120.0, -2.0, 3, amplitude_dps=20.0)
+        quiet = _noise_remedy("prop_harmonics", 120.0, -2.0, 3, amplitude_dps=1.7)
+        assert "CRITICAL" in loud
+        assert "CRITICAL" not in quiet
+        assert "1.7 deg/s" in quiet
+
+    def test_severity_still_fires_when_amplitude_is_real(self):
+        from inav_toolkit.blackbox_analyzer import _noise_remedy
+        r = _noise_remedy("motor_imbalance", 62.0, -2.0, 3, amplitude_dps=25.0)
+        assert "CRITICAL" in r
+
+    def test_unknown_amplitude_preserves_old_behaviour(self):
+        from inav_toolkit.blackbox_analyzer import _noise_remedy
+        r = _noise_remedy("prop_harmonics", 120.0, -2.0, 3)
+        assert "CRITICAL" in r
+
+    def test_analyze_noise_reports_absolute_amplitudes(self):
+        from inav_toolkit.blackbox_analyzer import analyze_noise
+        sr, n = 1000.0, 40000
+        t = np.arange(n) / sr
+        d = {"gyro_roll": 6.0 * np.sin(2 * np.pi * 350 * t)}
+        r = analyze_noise(d, "Roll", "gyro_roll", sr)
+        for k in ("rms_low_dps", "rms_mid_dps", "rms_high_dps", "rms_gt50_dps"):
+            assert k in r
+        assert abs(r["rms_high_dps"] - 6.0 / np.sqrt(2)) < 1.0
+        assert r["rms_low_dps"] < 1.0                # nothing down there

@@ -104,7 +104,7 @@ def _disable_colors():
 AXIS_NAMES = ["Roll", "Pitch", "Yaw"]
 AXIS_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D"]
 MOTOR_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D", "#A78BFA"]
-REPORT_VERSION = "2.23.7"
+REPORT_VERSION = "2.23.8"
 
 # ─── Frame and Prop Profiles ─────────────────────────────────────────────────
 # Two separate concerns:
@@ -1765,6 +1765,28 @@ def decode_blackbox_native(filepath, raw_params, quiet=False):
     data["_decoder_stats"] = decoder.stats         # {i_frames, p_frames, errors, ...}
     data["active_modes"] = _active_mode_series(decoder.slow_frames, len(data.get("time_s", [])))
 
+    # Reject physically impossible samples before any metric sees them. Done here,
+    # once, so every downstream analysis inherits it rather than each having to
+    # defend itself against a -5,423,494 deg/s gyro reading.
+    _sr = 1.0
+    _t = data.get("time_s")
+    if _t is not None and len(_t) > 1:
+        _dt = float(np.median(np.diff(np.asarray(_t, dtype=float))))
+        if _dt > 0:
+            _sr = 1.0 / _dt
+    data["n_rows"] = data.get("n_rows") or len(data.get("time_s", []))
+    integrity = sanitize_decoded_data(data, _sr)
+    data["_integrity"] = integrity
+    if integrity and not quiet:
+        ep = integrity["episodes"]
+        worst = ", ".join(f"{k} x{v}" for k, v in
+                          sorted(integrity["culprit_fields"].items(),
+                                 key=lambda kv: -kv[1])[:3])
+        print(f"  Log integrity: repaired {integrity['samples']} impossible samples "
+              f"({100*integrity['fraction']:.3f}%) in {len(ep)} episode(s) "
+              f"at t={', '.join(f'{e['start_s']:.1f}s' for e in ep[:4])}"
+              f"{' ...' if len(ep) > 4 else ''} — {worst}")
+
     # Detect available nav fields for downstream analysis
     nav_fields = [k for k in data if k.startswith("nav_") or k.startswith("att_") or k == "baro_alt"]
     data["_has_nav"] = len(nav_fields) > 0
@@ -2199,6 +2221,173 @@ def restrict_to_span(data, span):
     return out
 
 
+# ─── Log integrity: reject physically impossible samples ──────────────────────
+#
+# A corrupted log does not announce itself. On one 417 s flight gyro_yaw reached
+# -5,423,494 deg/s against a sensor full scale of +-2000, in a single 111 ms
+# episode whose magnitude decayed by exactly a factor of 3 per 16 ms (62.5 Hz
+# ringing, Q ~ 2.9). Only 105 samples, 0.025 % of the log -- but they made the
+# filtered yaw noise figure read 958 deg/s RMS above 50 Hz against 3.3 for the
+# raw signal, which is impossible since a lowpass cannot amplify. The only two
+# navPos steps over 5 m in the whole log were at the same instant, producing a
+# phantom "42 m GPS jump" at an implied 21891 m/s.
+#
+# Limits are deliberately generous: the job is to catch the impossible, not to
+# validate. Anything inside a sensor's full scale is left alone.
+GYRO_FULL_SCALE_DPS = 2500.0        # +-2000 dps sensors, with margin
+FIELD_ABS_LIMITS = {
+    "gyro_roll": GYRO_FULL_SCALE_DPS,
+    "gyro_pitch": GYRO_FULL_SCALE_DPS,
+    "gyro_yaw": GYRO_FULL_SCALE_DPS,
+    "gyro_raw_roll": GYRO_FULL_SCALE_DPS,
+    "gyro_raw_pitch": GYRO_FULL_SCALE_DPS,
+    "gyro_raw_yaw": GYRO_FULL_SCALE_DPS,
+    # Attitude has WRAP semantics, so its limit must not sit on the wrap boundary.
+    # INAV clamps attitude[] to +-1800 decidegrees but was observed emitting -1801
+    # while passing through inverted (-1793 -> -1801 -> +1791): real loop data, one
+    # LSB past its own clamp. A limit of 1800 flagged three Acro passes as
+    # corruption and would have interpolated away ~0.3 s of genuine flight. Twice
+    # full scale still catches gross corruption without touching wrap.
+    "att_roll": 3600.0,
+    "att_pitch": 3600.0,
+}
+FIELD_RANGE_LIMITS = {
+    "att_heading": (-100.0, 3700.0),    # decidegrees, 0..3600 plus slack
+    "motor0": (0.0, 2200.0), "motor1": (0.0, 2200.0),
+    "motor2": (0.0, 2200.0), "motor3": (0.0, 2200.0),
+    "throttle": (800.0, 2200.0),
+}
+# Corruption is cross-field: it hits several fields at one point in the file. Once
+# any field proves corruption, treat a window around it as suspect for every
+# field rather than trusting the ones that happen to stay in range.
+CORRUPTION_WINDOW_S = 0.05
+# Gaps up to this long are bridged by interpolation, which keeps spectra valid --
+# compute_psd() has no NaN handling, so blanking would poison every FFT and be
+# worse than the spike. Longer gaps are left as NaN: unrecoverable, and saying so
+# is more honest than inventing a second of flight.
+MAX_INTERPOLATE_S = 1.0
+
+
+def find_impossible_samples(data, sr):
+    """Boolean mask of samples proven corrupt, plus which fields proved it.
+
+    A field outside its sensor's full scale is not a measurement. Returns
+    (mask, {field: count}) with the mask widened to CORRUPTION_WINDOW_S around
+    each violation and merged, because corruption arrives as an episode."""
+    n = data.get("n_rows") or len(data.get("time_s", []))
+    if not n:
+        return None, {}
+    bad = np.zeros(n, dtype=bool)
+    culprits = {}
+    for key, lim in FIELD_ABS_LIMITS.items():
+        v = data.get(key)
+        if v is None or len(v) != n:
+            continue
+        m = np.abs(np.asarray(v, dtype=float)) > lim
+        c = int(np.count_nonzero(m))
+        if c:
+            culprits[key] = c
+            bad |= m
+    for key, (lo, hi) in FIELD_RANGE_LIMITS.items():
+        v = data.get(key)
+        if v is None or len(v) != n:
+            continue
+        a = np.asarray(v, dtype=float)
+        m = (a < lo) | (a > hi)
+        c = int(np.count_nonzero(m & ~np.isnan(a)))
+        if c:
+            culprits[key] = culprits.get(key, 0) + c
+            bad |= m & ~np.isnan(a)
+    if not bad.any():
+        return None, {}
+    # widen to an episode
+    w = max(1, int(CORRUPTION_WINDOW_S * sr))
+    widened = np.convolve(bad.astype(np.int8), np.ones(2 * w + 1, dtype=np.int8),
+                          mode="same") > 0
+    return widened, culprits
+
+
+def sanitize_decoded_data(data, sr):
+    """Repair proven-corrupt samples in place. Returns a report, or None.
+
+    Every per-sample series is treated, not only the field that tripped the
+    check: the evidence is that one bad point in the file damages several fields
+    at once, so a field that happens to stay inside its limits there is not
+    thereby trustworthy."""
+    mask, culprits = find_impossible_samples(data, sr)
+    if mask is None:
+        return None
+    n = len(mask)
+    spans = threshold_events(mask, sr, merge_s=CORRUPTION_WINDOW_S)
+    t = np.asarray(data.get("time_s", np.arange(n) / sr), dtype=float)
+    max_gap = int(MAX_INTERPOLATE_S * sr)
+    good = ~mask
+    idx = np.arange(n)
+    interpolated, blanked = 0, 0
+    for key, v in list(data.items()):
+        if key.startswith("_") or key in ("time_s", "time", "active_modes", "n_rows"):
+            continue
+        if not isinstance(v, np.ndarray) or v.ndim != 1 or len(v) != n:
+            continue
+        if not np.issubdtype(v.dtype, np.number):
+            continue
+        a = v.astype(float, copy=True)
+        for a0, b0 in spans:
+            if b0 - a0 <= max_gap and np.any(good):
+                a[a0:b0] = np.interp(idx[a0:b0], idx[good], a[good])
+            else:
+                a[a0:b0] = np.nan
+        data[key] = a
+    for a0, b0 in spans:
+        if b0 - a0 <= max_gap:
+            interpolated += b0 - a0
+        else:
+            blanked += b0 - a0
+    return {
+        "samples": int(np.count_nonzero(mask)),
+        "fraction": float(np.count_nonzero(mask)) / n,
+        "episodes": [{"start_s": round(float(t[a0]), 3),
+                      "duration_s": round((b0 - a0) / sr, 3)} for a0, b0 in spans],
+        "culprit_fields": culprits,
+        "interpolated_samples": interpolated,
+        "blanked_samples": blanked,
+    }
+
+
+# ─── Noise amplitude: what a dB figure cannot tell you ────────────────────────
+#
+# rms_high is the mean of psd_db above 300 Hz, i.e. dB relative to
+# 1 (deg/s)^2/Hz. It has no reference a pilot can judge, and the per-frame-size
+# thresholds sit close together: the 7-inch profile calls -20 dB "bad". One real
+# 7-inch log measured -19.0 dB on roll and was therefore reported CRITICAL,
+# "severe and likely causing visible oscillation" -- 1 dB over the line. The
+# actual amplitude above 300 Hz was 1.712 deg/s RMS. For scale, the same craft's
+# UNFILTERED gyro measures ~13 deg/s in that band, so the filters were removing
+# 87 % of it and the result was still called severe.
+#
+# So escalation now needs the amplitude to agree, not the dB alone. The dB
+# machinery is left in place -- it drives scoring and peak-finding in many
+# places -- but nothing is called CRITICAL while the amplitude is negligible.
+NOISE_AMPLITUDE_OK_DPS = 4.0     # below this, filtering is not the problem
+NOISE_AMPLITUDE_BAD_DPS = 12.0   # above this, it genuinely reaches the PIDs
+
+
+def noise_amplitude_dps(freqs, psd_db, f_lo, f_hi=None):
+    """Gyro noise amplitude in deg/s RMS over a band, from the PSD in dB.
+
+    psd_db is 10*log10 of a density in (deg/s)^2/Hz, so undo the log and
+    integrate over frequency to recover an amplitude that can be compared
+    against how much rate error actually reaches the controller."""
+    f = np.asarray(freqs, dtype=float)
+    m = f >= f_lo
+    if f_hi is not None:
+        m &= f <= f_hi
+    if not np.any(m):
+        return 0.0
+    psd = np.power(10.0, np.asarray(psd_db, dtype=float)[m] / 10.0)
+    return float(np.sqrt(np.trapezoid(psd, f[m])))
+
+
 def analyze_noise(data, axis_name, gyro_key, sr):
     if gyro_key not in data:
         return None
@@ -2217,6 +2406,12 @@ def analyze_noise(data, axis_name, gyro_key, sr):
         "rms_low": float(np.mean(low_band)) if len(low_band) > 0 else -80,
         "rms_mid": float(np.mean(mid_band)) if len(mid_band) > 0 else -80,
         "rms_high": float(np.mean(high_band)) if len(high_band) > 0 else -80,
+        # Absolute amplitudes alongside the dB figures, so a reader (and the
+        # escalation logic) can tell 1.7 deg/s from something that matters.
+        "rms_low_dps": noise_amplitude_dps(freqs, psd_db, 10, 100),
+        "rms_mid_dps": noise_amplitude_dps(freqs, psd_db, 100, 300),
+        "rms_high_dps": noise_amplitude_dps(freqs, psd_db, 300),
+        "rms_gt50_dps": noise_amplitude_dps(freqs, psd_db, 50),
     }
 
 
@@ -2282,15 +2477,27 @@ _NOISE_REMEDIES = {
 }
 
 
-def _noise_remedy(source, freq_hz, power_db, n_axes):
-    """Get prescriptive remedy for a noise source, with severity-specific advice."""
+def _noise_remedy(source, freq_hz, power_db, n_axes, amplitude_dps=None):
+    """Get prescriptive remedy for a noise source, with severity-specific advice.
+
+    `amplitude_dps` is the axis's total noise amplitude in deg/s RMS. When it is
+    known and negligible, the severity prefixes are withheld: a peak standing
+    proud of a very quiet floor is still a quiet peak, and telling a pilot that
+    1.7 deg/s is "severe and likely causing visible oscillation" sends them
+    chasing hardware faults that are not there."""
     base = _NOISE_REMEDIES.get(source, _NOISE_REMEDIES["unknown"])
 
+    negligible = (amplitude_dps is not None
+                  and amplitude_dps < NOISE_AMPLITUDE_OK_DPS)
+
     # Add severity context
-    if power_db > -5:
+    if power_db > -5 and not negligible:
         severity_prefix = "CRITICAL: This noise is severe and likely causing visible oscillation. "
-    elif power_db > -15:
+    elif power_db > -15 and not negligible:
         severity_prefix = "This is moderate noise that should be addressed. "
+    elif negligible:
+        severity_prefix = (f"Low amplitude ({amplitude_dps:.1f} deg/s RMS) - this peak is "
+                           "visible in the spectrum but small. Address only if you can feel it. ")
     else:
         severity_prefix = ""
 
@@ -2416,6 +2623,11 @@ def fingerprint_noise(noise_results, config, prop_harmonics=None):
     if not any(nr for nr in noise_results if nr is not None):
         return {"peaks": [], "dominant_source": "none", "summary": "No noise data available."}
 
+    # Loudest axis amplitude, used to withhold severity language when the noise a
+    # peak belongs to is negligible in absolute terms.
+    worst_axis_amplitude_dps = max(
+        (nr.get("rms_gt50_dps", 0.0) for nr in noise_results if nr), default=0.0)
+
     n_motors = config.get("_n_motors", 4)
 
     # Collect all significant peaks across axes with cross-axis correlation
@@ -2515,7 +2727,8 @@ def fingerprint_noise(noise_results, config, prop_harmonics=None):
             "source": source,
             "confidence": confidence,
             "detail": detail,
-            "remedy": _noise_remedy(source, freq, power, n_axes),
+            "remedy": _noise_remedy(source, freq, power, n_axes,
+                                    amplitude_dps=worst_axis_amplitude_dps),
         })
 
     # Determine dominant noise source (highest power classified peak)
@@ -5751,19 +5964,32 @@ def generate_action_plan(noise_results, pid_results, motor_analysis, dterm_resul
 
     if rec_gyro_lp is not None:
         worst_noise = max((nr["rms_high"] for nr in noise_results if nr), default=-80)
+        worst_dps = max((nr.get("rms_high_dps", 0.0) for nr in noise_results if nr),
+                        default=0.0)
         if worst_noise > bad_noise:
             prio, urg = 1, "CRITICAL"
         elif worst_noise > ok_noise:
             prio, urg = 2, "IMPORTANT"
         else:
             prio, urg = 5, None
+        # Amplitude veto: a dB figure 1 dB over a threshold is not grounds for
+        # CRITICAL when the noise it describes is 1.7 deg/s. See
+        # NOISE_AMPLITUDE_OK_DPS.
+        if urg is not None and worst_dps < NOISE_AMPLITUDE_OK_DPS:
+            prio, urg = 5, None
+        elif urg == "CRITICAL" and worst_dps < NOISE_AMPLITUDE_BAD_DPS:
+            prio, urg = 2, "IMPORTANT"
 
         if current_gyro_lp is not None and abs(rec_gyro_lp - current_gyro_lp) > 10:
             direction = "Reduce" if rec_gyro_lp < current_gyro_lp else "Increase"
             if rec_gyro_lp < current_gyro_lp:
-                reason = f"High-freq noise at {worst_noise:.0f} dB avg - lower cutoff will reduce noise reaching the PID controller"
+                reason = (f"High-freq noise at {worst_noise:.0f} dB avg "
+                          f"({worst_dps:.1f} deg/s RMS above 300Hz) - lower cutoff will "
+                          f"reduce noise reaching the PID controller")
             else:
-                reason = f"Noise floor is clean ({worst_noise:.0f} dB avg) - raising cutoff reduces filter delay with no noise penalty"
+                reason = (f"Noise floor is clean ({worst_noise:.0f} dB avg, "
+                          f"{worst_dps:.1f} deg/s RMS above 300Hz) - raising cutoff "
+                          f"reduces filter delay with no noise penalty")
             actions.append({"priority": prio, "urgency": urg, "category": "Filter",
                 "action": f"Gyro lowpass filter: {direction} from {current_gyro_lp}Hz to {rec_gyro_lp}Hz",
                 "param": "gyro_lowpass_hz", "current": current_gyro_lp, "new": rec_gyro_lp,

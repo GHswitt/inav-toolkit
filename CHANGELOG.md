@@ -5,6 +5,61 @@ All notable changes to this fork, relative to the verbatim upstream import.
 Format: each entry corresponds to one commit. See `git log` for full reasoning and the
 measurements behind each change.
 
+## [2.23.8] — 2026-09-27
+
+### Fixed
+
+- **Physically impossible samples reached every metric.** One 417 s log contained `gyro_yaw`
+  readings of **−5,423,494 deg/s** against a sensor full scale of ±2000 — a single 208 ms
+  episode whose magnitude decayed by exactly a factor of 3 per 16 ms (62.5 Hz ringing, Q ≈ 2.9),
+  0.050 % of samples. Consequences: the filtered yaw noise figure read **958 deg/s RMS above
+  50 Hz against 3.3 for the raw signal**, which is impossible since a lowpass cannot amplify;
+  and the only two `navPos` steps over 5 m in the whole log sat at the same instant, producing
+  a phantom "42 m GPS jump" at an implied 21891 m/s.
+
+  `find_impossible_samples()` / `sanitize_decoded_data()` now run once in the decode path, so
+  every downstream analysis inherits the repair. Limits are deliberately generous — the job is
+  catching the impossible, not validating. Repair is **cross-field and episode-based**: once any
+  field proves corruption, a ±50 ms window is treated as suspect for all per-sample fields,
+  because the evidence is that one bad point in the file damages several at once. Short gaps are
+  **interpolated, not blanked** — `compute_psd()` has no NaN handling, so blanking would poison
+  every FFT and be worse than the spike; gaps beyond 1 s are left NaN rather than inventing a
+  second of flight. After: yaw 958 → **1.383** deg/s (below its raw 3.312, as it must be),
+  `navPos` steps over 5 m **2 → 0**, roll and pitch unchanged to three decimals.
+
+  Attitude is excluded from tight bounds because it **wraps**: INAV clamps `attitude[]` to
+  ±1800 decidegrees but was observed emitting −1801 while passing through inverted
+  (−1793 → −1801 → +1791). A limit of 1800 flagged three Acro passes as corruption and would
+  have interpolated away ~0.3 s of genuine loop data. The limit is twice full scale, which
+  still catches gross corruption.
+
+- **A dB figure with no reference drove CRITICAL.** `rms_high` is the mean of `psd_db` above
+  300 Hz, i.e. dB relative to 1 (deg/s)²/Hz — a quantity no pilot can judge — and the
+  per-frame-size thresholds sit close together. A real 7-inch log measured **−19.0 dB on roll
+  against a −20 dB "bad" threshold** and was reported CRITICAL, *"severe and likely causing
+  visible oscillation"* — **1 dB over the line**, for an actual amplitude of **1.712 deg/s RMS**.
+  The same craft's *unfiltered* gyro measures ~13 deg/s in that band, so the filters were
+  removing 87 % of it and the result was still called severe.
+
+  `noise_amplitude_dps()` recovers deg/s RMS by integrating the PSD, and `analyze_noise()` now
+  reports `rms_low_dps` / `rms_mid_dps` / `rms_high_dps` / `rms_gt50_dps` beside the dB figures.
+  Escalation now requires the amplitude to agree, at both paths — the LPF action (capped at
+  IMPORTANT below 12 deg/s, dropped below 4) and the noise-fingerprint remedies (a separate
+  per-peak `power_db` metric, whose severity language is withheld and replaced with the measured
+  amplitude). Where amplitude is unknown, previous behaviour is preserved. Reason strings now
+  name the amplitude, so "High-freq noise at −19 dB avg" reads "… (1.7 deg/s RMS above 300Hz)".
+
+  Verified not over-reaching: on that log both CRITICALs become "Low amplitude (2.7 deg/s RMS)"
+  while the structural `dynamic_gyro_notch_min_hz: 60 → 40` recommendation survives as the top
+  action — the craft's 1P sits at 62 Hz, 2 Hz above the notch floor.
+
+### Known
+
+- The **noise score itself** still derives from `rms_high` in dB alone, so that log still scores
+  Noise:20 despite 2.7 deg/s of actual noise. Left unchanged deliberately: the score is recorded
+  per flight in downstream tuning logs, and changing the formula would break comparability with
+  every historical row.
+
 ## [2.23.7] — 2026-09-27
 
 ### Fixed
