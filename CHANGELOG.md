@@ -5,6 +5,45 @@ All notable changes to this fork, relative to the verbatim upstream import.
 Format: each entry corresponds to one commit. See `git log` for full reasoning and the
 measurements behind each change.
 
+## [2.23.14] — 2026-09-28
+
+### Fixed
+
+- **`INC` prediction hardcoded +1 and discarded the delta**, and **`loopIteration` was never
+  mapped** (the same gap `gyroRaw` had before 2.23.0). `values[i] = prev[i] + 1` advanced the
+  iteration counter once per logged frame instead of once per `P interval`, and each I-frame's
+  absolute value then corrected the shortfall — producing a step histogram of 15x1 followed by
+  1x17, and an apparent **222 s of "missed logging" on a 417 s flight** that was entirely this
+  bug. Now `raw[i] + prev[i] + iter_increment`, with the increment derived from the header's
+  `P interval`. LOG00007's histogram collapses to **417,059 steps of exactly 2**.
+
+- ⚠ **Correction to 2.23.13's release note and to the timebase concern generally.** It was
+  claimed that the synthetic timebase made every reported frequency wrong by ~5 % and flight
+  durations unreliable. **Both were overstated.** With `INC` fixed, `loopIteration` implies
+  **998.8–999.9 Hz** against the assumed 1000 — accurate to ~0.1 %. The 947 Hz figure quoted from
+  the `orangebox` reference was a median-of-diffs artifact on a field containing I-frame jumps,
+  not a measured rate. The synthetic 1 kHz grid was very nearly right all along.
+
+### Changed
+
+- `loop_iteration` is now available to analyses, giving a real **stream-desynchronisation
+  detector**: a step other than `P interval` means the decoder lost the frame boundary.
+
+### Known
+
+- **Corruption episodes are decoder desynchronisation, not bad data or dropped frames.** With
+  `INC` fixed, 98–99.5 % of all irregular iteration steps fall inside a ~200 ms window around a
+  corruption episode (LOG00007 209/212, LOG00005 302/308, LOG00002 213/214), the nearest at
+  exactly the episode's start. The reader is interpreting bytes at the wrong offsets for that
+  span, which is why `gyro_yaw` reached −5,423,494 and why the episodes survived the arithmetic
+  fix in 2.23.13. Root cause not yet located; the next step is byte-level inspection at the frame
+  index where sync is lost.
+- A few genuinely isolated gaps exist separately (LOG00007 t=3.27 s, 892 iterations), consistent
+  with real logging interruptions rather than desync.
+- `STRAIGHT_LINE` prediction and the `CLAMP = 2**31` fallback remain broken for the `time` field.
+  Lower priority now: `loop_iteration` supplies a sound timebase and gap detection by an easier
+  route.
+
 ## [2.23.13] — 2026-09-28
 
 ### Fixed

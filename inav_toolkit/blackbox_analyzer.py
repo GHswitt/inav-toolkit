@@ -104,7 +104,7 @@ def _disable_colors():
 AXIS_NAMES = ["Roll", "Pitch", "Yaw"]
 AXIS_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D"]
 MOTOR_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D", "#A78BFA"]
-REPORT_VERSION = "2.23.13"
+REPORT_VERSION = "2.23.14"
 
 # ─── Frame and Prop Profiles ─────────────────────────────────────────────────
 # Two separate concerns:
@@ -995,6 +995,17 @@ class BlackboxDecoder:
 
     def __init__(self, raw_params):
         self.params = raw_params
+        # Iterations between logged frames, from "P interval" (e.g. "1/2" = every
+        # 2nd loop). Used by the INC predictor; 1 when the header is absent.
+        self._iter_increment = 1
+        try:
+            _pi = str(self.params.get('P interval', '')).strip()
+            if '/' in _pi:
+                _num, _den = _pi.split('/')
+                self._iter_increment = max(1, int(_den) // max(int(_num), 1))
+        except (ValueError, ZeroDivisionError):
+            self._iter_increment = 1
+
         self.i_def = self._parse_field_def('I')
         self.p_def = self._parse_field_def('P', fallback_names=self.i_def)
         self.s_def = self._parse_field_def('S')
@@ -1280,7 +1291,13 @@ class BlackboxDecoder:
                 else:
                     values[i] = raw[i] + prev[i]
             elif pred == self.PRED_INC:
-                values[i] = prev[i] + 1
+                # Increment by the logging interval, and keep the delta. This
+                # hardcoded +1 and discarded raw[i], so loopIteration advanced one
+                # per frame instead of `P interval` per frame; each I-frame's
+                # absolute value then corrected the shortfall, giving a step
+                # histogram of 15x1 then 1x17 and an apparent 222 s of "missed
+                # logging" on a 417 s flight that was entirely this bug.
+                values[i] = raw[i] + prev[i] + self._iter_increment
             elif pred == self.PRED_1500:
                 values[i] = raw[i] + 1500
             elif pred == self.PRED_VBATREF:
@@ -1637,6 +1654,11 @@ class BlackboxDecoder:
         # Map to standard analysis keys
         col_map = {
             "time": ["time"],
+            # Decoded but never mapped, like gyroRaw before 2.23.0. It is the most
+            # trustworthy timing source in the log: predictor 6 (INC) is just
+            # prev + 1, and a gap in it marks a logging iteration the FC actually
+            # dropped -- which the synthetic uniform timebase silently hides.
+            "loop_iteration": ["loopIteration"],
             "loopiter": ["loopIteration"],
             "gyro_roll": ["gyroADC[0]", "gyroData[0]", "gyro[0]"],
             "gyro_pitch": ["gyroADC[1]", "gyroData[1]", "gyro[1]"],
