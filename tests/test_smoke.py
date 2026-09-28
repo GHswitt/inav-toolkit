@@ -2327,3 +2327,50 @@ class TestFrameCadenceArtifact:
         before = d["gyro_raw_roll"].copy()
         assert remove_cadence_artifact(d, self.SR, {"confirmed": False}) == 0
         assert np.array_equal(d["gyro_raw_roll"], before)
+
+
+class TestNoisePeakFloor:
+    """0 Hz is not a vibration frequency."""
+
+    SR = 1000.0
+
+    def _psd(self, hz_list, dc=True):
+        from inav_toolkit.blackbox_analyzer import compute_psd
+        n = 40000
+        t = np.arange(n) / self.SR
+        sig = np.zeros(n)
+        if dc:
+            sig += 50.0                       # DC offset
+            sig += 30.0 * np.sin(2 * np.pi * 0.7 * t)   # slow pilot input
+        for hz in hz_list:
+            sig += 8.0 * np.sin(2 * np.pi * hz * t)
+        return compute_psd(sig, self.SR)
+
+    def test_dc_and_pilot_input_are_not_peaks(self):
+        from inav_toolkit.blackbox_analyzer import find_noise_peaks
+        freqs, psd = self._psd([])
+        peaks = find_noise_peaks(freqs, psd)
+        assert all(p["freq_hz"] >= 5.0 for p in peaks), [p["freq_hz"] for p in peaks]
+
+    def test_real_peaks_still_found(self):
+        from inav_toolkit.blackbox_analyzer import find_noise_peaks
+        freqs, psd = self._psd([120.0])
+        peaks = find_noise_peaks(freqs, psd)
+        assert any(abs(p["freq_hz"] - 120.0) < 3 for p in peaks), [p["freq_hz"] for p in peaks]
+
+    def test_propwash_band_is_not_suppressed(self):
+        """Propwash is real and lives at 10-40 Hz, above the floor."""
+        from inav_toolkit.blackbox_analyzer import find_noise_peaks
+        freqs, psd = self._psd([22.0])
+        peaks = find_noise_peaks(freqs, psd)
+        assert any(abs(p["freq_hz"] - 22.0) < 3 for p in peaks), [p["freq_hz"] for p in peaks]
+
+    def test_info_items_use_the_schema_the_report_prints(self):
+        """print_terminal_report reads item['text']; a 'title' key crashed every
+        short flight with KeyError and produced no report at all."""
+        import inspect
+        from inav_toolkit import blackbox_analyzer as B
+        src = inspect.getsource(B)
+        i = src.index("Short flight (")
+        block = src[max(0, i - 300):i + 200]
+        assert '"text": f"Short flight' in block, block[-260:]

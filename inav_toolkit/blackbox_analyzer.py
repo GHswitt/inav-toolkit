@@ -104,7 +104,7 @@ def _disable_colors():
 AXIS_NAMES = ["Roll", "Pitch", "Yaw"]
 AXIS_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D"]
 MOTOR_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D", "#A78BFA"]
-REPORT_VERSION = "2.23.16"
+REPORT_VERSION = "2.23.17"
 
 # ─── Frame and Prop Profiles ─────────────────────────────────────────────────
 # Two separate concerns:
@@ -2234,10 +2234,26 @@ def compute_psd(arr, sr, nperseg=None):
     return freqs, 10 * np.log10(psd + 1e-20)
 
 
-def find_noise_peaks(freqs, psd_db, n_peaks=5, min_height_db=-30, min_prominence=6):
+# Below this, a "peak" is the pilot, not the airframe: stick input, attitude
+# changes and the DC bin all live here. 0 Hz is not a vibration frequency at all,
+# yet a peak there was being reported as "Vibration at 0Hz on Pitch, Roll".
+# Propwash (~10-40 Hz) and frame resonance sit above this, so nothing real is lost.
+NOISE_PEAK_MIN_HZ = 5.0
+
+
+def find_noise_peaks(freqs, psd_db, n_peaks=5, min_height_db=-30, min_prominence=6,
+                     min_freq_hz=NOISE_PEAK_MIN_HZ):
     peaks, props = signal.find_peaks(psd_db, height=min_height_db, prominence=min_prominence, distance=10)
     if len(peaks) == 0:
         return []
+    if min_freq_hz:
+        keep = np.asarray(freqs)[peaks] >= min_freq_hz
+        peaks = peaks[keep]
+        for k in ("prominences",):
+            if k in props:
+                props[k] = np.asarray(props[k])[keep]
+        if len(peaks) == 0:
+            return []
     prominences = props.get("prominences", np.zeros(len(peaks)))
     order = np.argsort(prominences)[::-1][:n_peaks]
     results = [{"freq_hz": float(freqs[peaks[i]]), "power_db": float(psd_db[peaks[i]]),
@@ -6864,7 +6880,7 @@ def generate_action_plan(noise_results, pid_results, motor_analysis, dterm_resul
     scores["confidence_weight"] = _w
     if _conf != "good":
         info_items.append({
-            "title": f"Short flight ({duration:.0f}s) - scores are {_conf}-confidence",
+            "text": f"Short flight ({duration:.0f}s) - scores are {_conf}-confidence",
             "detail": (f"Below {FLIGHT_CONFIDENCE_GOOD_S:.0f}s there are fewer step events, "
                        "less throttle variety and less hover, so a single manoeuvre moves the "
                        "score. Treat this flight as indicative and weight longer logs more "

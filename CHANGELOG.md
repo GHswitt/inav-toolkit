@@ -5,6 +5,37 @@ All notable changes to this fork, relative to the verbatim upstream import.
 Format: each entry corresponds to one commit. See `git log` for full reasoning and the
 measurements behind each change.
 
+## [2.23.17] — 2026-09-28
+
+### Fixed
+
+- **The short-flight notice added in 2.23.16 crashed the report.** `info_items` entries are
+  printed as `item['text']`; it used `title`, so `print_terminal_report` raised
+  `KeyError: 'text'`. The item is only appended when confidence is not "good", so it failed on
+  **exactly the flights it was meant to help** — every log under 180 s produced no report at all,
+  while the four longer ones passed. The full suite passed too, because nothing exercises
+  `print_terminal_report` with a short-flight plan.
+
+- **Peaks below 5 Hz were classified as vibration.** `find_noise_peaks()` searched the whole
+  spectrum with no lower bound, so the DC bin and sub-flight-band content — stick input, attitude
+  changes — entered the peak list and were reported as `Vibration at 0Hz on Pitch, Roll`. The
+  accelerometer path filtered `>= 5 Hz` after calling it, but the gyro path passed peaks straight
+  to the fingerprinter. The floor now lives inside `find_noise_peaks` so every caller inherits it.
+
+  Not cosmetic: the phantom source fed dominant-source selection and recipe choice. LOG00002 moves
+  from "Harmonic Defense" to "Balanced" once it is removed. `NOISE_PEAK_MIN_HZ = 5.0` keeps
+  propwash (10–40 Hz) and frame resonance; tests pin that 0.7 Hz pilot input and DC produce no
+  peaks while 22 Hz and 120 Hz still do.
+
+### Known
+
+- No test renders a report end-to-end per confidence band, which is why the `title`/`text` slip
+  shipped. The added test pins that one key, not the next one.
+- **LOG00002 scores noise 0** — a hard bottom-of-scale value on a flight with the best PID and
+  motor scores of seven. Unverified; suspect a clamp.
+- **Six of seven logs select "Harmonic Defense"**, spanning noise scores 17 to 51. A recipe that
+  selects almost regardless of input is describing its threshold rather than the flight.
+
 ## [2.23.16] — 2026-09-28
 
 ### Added
