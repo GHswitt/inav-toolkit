@@ -5,6 +5,48 @@ All notable changes to this fork, relative to the verbatim upstream import.
 Format: each entry corresponds to one commit. See `git log` for full reasoning and the
 measurements behind each change.
 
+## [2.23.15] — 2026-09-28
+
+### Fixed
+
+- **Root cause of the corruption episodes: P-frames were never validated.** I-frames were
+  sanity-checked and rejected on failure; P-frames were appended unconditionally. So one
+  mis-parsed P-frame became the predictor baseline for every frame after it, cascading for
+  ~200 ms until an I-frame reset the state — producing `gyro_yaw` of **−5,423,494 deg/s** against
+  a ±2000 sensor, while the decoder reported `errors: 0`, called no resync and failed no
+  validation.
+
+  Proven with an independent decoder: `orangebox` reads the same bytes and finds **zero**
+  impossible values in the whole log, with normal ±200 deg/s exactly where we produced −5.4 M.
+  The bytes were always sound; the corruption was manufactured here.
+
+  `_validate_p_frame()` now rejects a frame whose gyro exceeds sensor full scale, whose motor
+  output is outside throttle range, or whose `loopIteration` goes backwards, then rewinds and
+  resyncs. **One bad P-frame is caught per log**, and that is enough:
+
+  | log | before | after |
+  |---|---|---|
+  | LOG00002 | 212 samples, 1 episode | **0, 0** |
+  | LOG00007 | 208 samples, 1 episode | **0, 0** |
+  | LOG00005 | 302 samples, 2 episodes | 201 samples, 1 episode |
+
+- **Predictor state now resets on `LOGGING_RESUME`**, since frame history predating a logging
+  pause cannot meaningfully predict across it. Note these events do not occur in the sample logs
+  (`logging_resumes: 0`), so this is correctness rather than a fix for the above.
+
+### Known
+
+- **LOG00005 retains one episode** (201 samples): values wrong but within the validator's bounds.
+  Tightening the bounds risks rejecting real data, so this needs the specific mis-parse located
+  first.
+- **~40 % of frames differ from `orangebox` by exactly 1**, plus ~3 % by 5–99. The ±1 bulk is
+  consistent with a rounding-convention difference — the C reference truncates toward zero
+  (2.23.13) while `orangebox` may floor — in which case ours is correct per the reference. **Not
+  proven**, and the 5–99 tail does not fit that explanation. Open.
+- A divergence test run earlier compared against *sanitized* output and so could not have located
+  the episodes; the 2.23.8 sanitizer had already repaired them. Method error, recorded so it is
+  not repeated.
+
 ## [2.23.14] — 2026-09-28
 
 ### Fixed

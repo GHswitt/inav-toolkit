@@ -104,7 +104,7 @@ def _disable_colors():
 AXIS_NAMES = ["Roll", "Pitch", "Yaw"]
 AXIS_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D"]
 MOTOR_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D", "#A78BFA"]
-REPORT_VERSION = "2.23.14"
+REPORT_VERSION = "2.23.15"
 
 # ─── Frame and Prop Profiles ─────────────────────────────────────────────────
 # Two separate concerns:
@@ -1020,11 +1020,20 @@ class BlackboxDecoder:
         self.motor_output_low = int(mo.split(',')[0]) if ',' in mo else self.minthrottle
 
         self._motor0_idx = None
+        self._gyro0_idx = None
         if self.i_def:
             try:
                 self._motor0_idx = self.i_def['names'].index('motor[0]')
             except ValueError:
                 pass
+            # Index of gyroADC[0]; the three gyro axes are contiguous. Used to
+            # sanity-check P-frames against the sensor's full scale.
+            for _n in ('gyroADC[0]', 'gyroRaw[0]'):
+                try:
+                    self._gyro0_idx = self.i_def['names'].index(_n)
+                    break
+                except ValueError:
+                    continue
 
         self.stats = {'i_frames': 0, 'p_frames': 0, 'errors': 0,
                       'skipped_events': 0, 'skipped_slow': 0, 'skipped_gps': 0}
@@ -1432,6 +1441,7 @@ class BlackboxDecoder:
             elif evt_type == self.EVT_LOGGING_RESUME:
                 self._read_unsigned_vb()  # iteration
                 self._read_unsigned_vb()  # currentTime
+                return 'resume'
             elif evt_type == self.EVT_FLIGHT_MODE:
                 self._read_unsigned_vb()  # flags
                 self._read_unsigned_vb()  # lastFlags
@@ -1472,6 +1482,30 @@ class BlackboxDecoder:
             elif self.buf[self.pos] in self.VALID_FRAMES:
                 return  # Found frame data
             self.pos += 1
+
+    def _validate_p_frame(self, values, prev):
+        """Sanity check a P-frame. Returns False if clearly garbage.
+
+        P-frames were accepted unconditionally while I-frames were validated, so a
+        mis-parse produced impossible values -- gyro_yaw reached -5,423,494 deg/s
+        against a +-2000 sensor -- with no exception, no resync and no error
+        counted. A reference decoder reads the same bytes cleanly, so these values
+        are manufactured here; the least this layer can do is notice."""
+        n = len(values)
+        if self._gyro0_idx is not None and self._gyro0_idx + 2 < n:
+            for k in range(3):
+                g = values[self._gyro0_idx + k]
+                if g > GYRO_FULL_SCALE_DPS or g < -GYRO_FULL_SCALE_DPS:
+                    return False
+        if self._motor0_idx is not None and self._motor0_idx < n:
+            m0 = values[self._motor0_idx]
+            max_motor = self._int_param('maxthrottle', 2000)
+            if m0 < self.minthrottle - 200 or m0 > max_motor + 500:
+                return False
+        # loopIteration must not go backwards
+        if n > 0 and prev and values[0] < prev[0]:
+            return False
+        return True
 
     def _validate_i_frame(self, values):
         """Sanity check I-frame values. Returns False if clearly garbage."""
@@ -1559,6 +1593,12 @@ class BlackboxDecoder:
                 try:
                     raw = self._decode_raw_values(self.p_def)
                     values = self._apply_p_predictors(raw, prev, prev_prev)
+                    if not self._validate_p_frame(values, prev):
+                        self.stats['errors'] += 1
+                        self.stats['bad_p_frames'] = self.stats.get('bad_p_frames', 0) + 1
+                        self.pos = saved
+                        if not self._resync(): break
+                        continue
                     all_frames.append(values)
                     prev_prev, prev = prev, values
                     self.stats['p_frames'] += 1
@@ -1575,6 +1615,12 @@ class BlackboxDecoder:
                 self.stats['skipped_events'] += 1
                 if result == 'log_end':
                     prev, prev_prev = None, None  # reset for new log
+                elif result == 'resume':
+                    # Logging paused and resumed: the frame history predates the
+                    # gap, so predicting across it is meaningless. A real gap of
+                    # 56 iterations sits exactly at one corruption episode.
+                    prev, prev_prev = None, None
+                    self.stats['logging_resumes'] = self.stats.get('logging_resumes', 0) + 1
 
             elif byte == self.FRAME_S:
                 self.pos += 1
