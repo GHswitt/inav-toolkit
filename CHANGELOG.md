@@ -5,6 +5,40 @@ All notable changes to this fork, relative to the verbatim upstream import.
 Format: each entry corresponds to one commit. See `git log` for full reasoning and the
 measurements behind each change.
 
+## [2.23.18] — 2026-09-28
+
+### Changed
+
+- **The noise score is computed from amplitude, not dB.** ⚠ **Scores from earlier versions are
+  not comparable.** The old scale ran linearly from good = −40 dB to bad = −20 dB and saturated
+  at zero above −20, so one log measuring **2.87 deg/s** of filtered gyro noise above 300 Hz
+  scored **0/100** while having the best PID (84) and motor (89) scores of seven flights.
+
+  dB re 1 (deg/s)²/Hz is also **bandwidth-dependent**: at a 1 kHz log rate `rms_high` integrates
+  over 200 Hz, and the same craft logged at 2 kHz integrates over 700 Hz and reads a different dB
+  for identical noise. Re-tuning the endpoints would have fixed today's logs and broken silently
+  on a `blackbox_rate_denom` change. Amplitude has neither problem.
+
+  Endpoints are anchored on the constants established for the escalation veto rather than
+  invented: `NOISE_SCORE_BAD_DPS = 12.0` matches `NOISE_AMPLITUDE_BAD_DPS` ("genuinely reaches the
+  PIDs"), and `NOISE_SCORE_GOOD_DPS = 0.5` is an excellent filtered signal. Results without
+  `rms_high_dps` (pre-2.23.9) fall back to the old formula.
+
+  Seven real logs move from 0–51 to **81–99**. The spread compresses because the craft is
+  genuinely clean at 0.8–2.9 deg/s throughout — a flight at 6 deg/s scores 52 and at 12 scores 0,
+  so the mid-range still discriminates. Noise simply stops being a useful axis for comparing
+  flights that are all quiet.
+
+### Fixed
+
+- **"Harmonic Defense" selected on six of seven logs**, across noise scores from 17 to 51. Its
+  condition was `has_prop_harmonics and not rpm_enabled` — presence, not magnitude — and presence
+  is near-automatic, because the prop-harmonic bands derived from KV span **233–1554 Hz** (2nd)
+  and **350–2331 Hz** (3rd), so almost any high-frequency peak falls inside one. With RPM off the
+  branch reduced to that alone. Now also requires `worst_recipe_dps >= NOISE_AMPLITUDE_OK_DPS`,
+  matching the veto 2.23.12 applied to the sibling branch. All seven logs now select "Balanced";
+  a test pins that a genuinely loud craft still gets "Harmonic Defense".
+
 ## [2.23.17] — 2026-09-28
 
 ### Fixed

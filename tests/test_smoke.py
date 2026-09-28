@@ -2374,3 +2374,62 @@ class TestNoisePeakFloor:
         i = src.index("Short flight (")
         block = src[max(0, i - 300):i + 200]
         assert '"text": f"Short flight' in block, block[-260:]
+
+    def test_recipe_needs_loud_harmonics_not_merely_present(self):
+        """has_prop_harmonics is presence, not magnitude, and the KV-derived bands
+        span 233-2331 Hz so nearly any high peak lands inside one. A quiet craft
+        must not be handed an aggressive filter stack."""
+        from inav_toolkit.blackbox_analyzer import (generate_tuning_recipe,
+                                                    get_frame_profile,
+                                                    NOISE_AMPLITUDE_OK_DPS)
+        prof = get_frame_profile(7)
+        fp = {"peaks": [{"freq_hz": 300.0, "power_db": -25.0,
+                         "source": "prop_harmonics", "axes": ["Roll"],
+                         "n_axes": 1, "prominence": 8.0}],
+              "dominant_source": "prop_harmonics", "summary": ""}
+        cfg = {"_n_motors": 4, "gyro_main_lpf_hz": 90}
+
+        def mk(dps):
+            return [{"axis": a, "rms_high": -19.0, "rms_high_dps": dps,
+                     "rms_low": -15.0, "rms_mid": -18.0, "peaks": [],
+                     "freqs": np.array([0.0]), "psd_db": np.array([-60.0]),
+                     "noise_start_freq": 500.0}
+                    for a in ("Roll", "Pitch", "Yaw")]
+
+        quiet = generate_tuning_recipe(mk(NOISE_AMPLITUDE_OK_DPS - 1.0), fp, cfg, prof)
+        loud = generate_tuning_recipe(mk(NOISE_AMPLITUDE_OK_DPS + 10.0), fp, cfg, prof)
+        assert quiet["recipe_name"] != "Harmonic Defense", quiet["recipe_name"]
+        assert loud["recipe_name"] == "Harmonic Defense", loud["recipe_name"]
+
+
+class TestNoiseScoreCalibration:
+    """The noise score must track amplitude a pilot can reason about."""
+
+    def _score(self, dps):
+        from inav_toolkit.blackbox_analyzer import (NOISE_SCORE_GOOD_DPS,
+                                                    NOISE_SCORE_BAD_DPS)
+        import numpy as _np
+        return float(_np.clip((dps - NOISE_SCORE_BAD_DPS)
+                              / (NOISE_SCORE_GOOD_DPS - NOISE_SCORE_BAD_DPS) * 100, 0, 100))
+
+    def test_clean_craft_scores_well(self):
+        """2.87 deg/s scored 0/100 on the old dB scale."""
+        assert self._score(2.87) > 70
+        assert self._score(0.81) > 90
+
+    def test_genuinely_noisy_craft_scores_badly(self):
+        from inav_toolkit.blackbox_analyzer import NOISE_AMPLITUDE_BAD_DPS
+        assert self._score(NOISE_AMPLITUDE_BAD_DPS) == 0.0
+        assert self._score(20.0) == 0.0
+
+    def test_monotonic_in_amplitude(self):
+        vals = [self._score(d) for d in (0.5, 1.0, 2.0, 4.0, 8.0, 12.0)]
+        assert vals == sorted(vals, reverse=True), vals
+
+    def test_falls_back_when_amplitude_missing(self):
+        """Pre-2.23.9 results carry no rms_high_dps."""
+        import inspect
+        from inav_toolkit import blackbox_analyzer as B
+        src = inspect.getsource(B)
+        i = src.index("dps = nr.get(\"rms_high_dps\")")
+        assert "else:" in src[i:i + 700] and "rms_high" in src[i:i + 700]

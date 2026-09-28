@@ -104,7 +104,7 @@ def _disable_colors():
 AXIS_NAMES = ["Roll", "Pitch", "Yaw"]
 AXIS_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D"]
 MOTOR_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D", "#A78BFA"]
-REPORT_VERSION = "2.23.17"
+REPORT_VERSION = "2.23.18"
 
 # ─── Frame and Prop Profiles ─────────────────────────────────────────────────
 # Two separate concerns:
@@ -2492,6 +2492,13 @@ def sanitize_decoded_data(data, sr):
 # places -- but nothing is called CRITICAL while the amplitude is negligible.
 NOISE_AMPLITUDE_OK_DPS = 4.0     # below this, filtering is not the problem
 NOISE_AMPLITUDE_BAD_DPS = 12.0   # above this, it genuinely reaches the PIDs
+
+# Noise score endpoints, in deg/s RMS above 300 Hz on the filtered gyro.
+# 0.5 is an excellent filtered signal; 12 matches NOISE_AMPLITUDE_BAD_DPS, where
+# noise genuinely reaches the controller. Replaces a dB scale that scored a clean
+# craft 0/100 -- see the note at the scoring site.
+NOISE_SCORE_GOOD_DPS = 0.5
+NOISE_SCORE_BAD_DPS = 12.0
 
 
 def noise_amplitude_dps(freqs, psd_db, f_lo, f_hi=None):
@@ -6766,7 +6773,24 @@ def generate_action_plan(noise_results, pid_results, motor_analysis, dterm_resul
     noise_scores = []
     for nr in noise_results:
         if nr:
-            s = np.clip((nr["rms_high"] - bad_noise) / (good_noise - bad_noise) * 100, 0, 100)
+            # Score on AMPLITUDE, not dB. The dB scale ran good=-40 to bad=-20 for a
+            # 7-inch, and saturated at zero for anything at or above -20 -- so a log
+            # measuring 2.87 deg/s of filtered gyro noise above 300 Hz scored 0/100
+            # while having the best PID and motor scores of seven flights. dB re
+            # 1 (deg/s)^2/Hz is also bandwidth-dependent: the same craft logged at
+            # 2 kHz integrates over 700 Hz instead of 200 and reads differently for
+            # identical noise. Amplitude has neither problem.
+            #
+            # Anchored on the constants established for the escalation veto:
+            # NOISE_AMPLITUDE_OK_DPS = 4 is "filtering is not the problem" and
+            # NOISE_AMPLITUDE_BAD_DPS = 12 is "this genuinely reaches the PIDs".
+            dps = nr.get("rms_high_dps")
+            if dps is not None:
+                s = np.clip((dps - NOISE_SCORE_BAD_DPS)
+                            / (NOISE_SCORE_GOOD_DPS - NOISE_SCORE_BAD_DPS) * 100, 0, 100)
+            else:
+                # Pre-2.23.9 results carry no amplitude; fall back to the old scale.
+                s = np.clip((nr["rms_high"] - bad_noise) / (good_noise - bad_noise) * 100, 0, 100)
             noise_scores.append(s)
     pid_scores = []
     pid_measurable = False
@@ -6938,6 +6962,17 @@ def generate_tuning_recipe(noise_results, noise_fp, config, profile, accel_vib=N
     rpm_enabled = config.get("rpm_filter_enabled") not in (None, 0, "0", "OFF")
     dyn_notch_enabled = config.get("dyn_notch_enabled") not in (None, 0, "0", "OFF")
 
+    # Amplitude gate for recipe selection. "has_prop_harmonics" is presence, not
+    # magnitude, and with RPM off the Harmonic Defense branch reduced to it alone —
+    # so six of seven logs selected an aggressive filter stack across noise scores
+    # from 17 to 51. It is presence-by-construction too: the prop-harmonic bands
+    # derived from KV span 233-1554 Hz (2nd) and 350-2331 Hz (3rd), so nearly any
+    # high-frequency peak falls inside one.
+    worst_recipe_dps = 0.0
+    for _nr in noise_results or []:
+        if _nr:
+            worst_recipe_dps = max(worst_recipe_dps, _nr.get("rms_high_dps", 0.0))
+
     # Has accel vibration issues?
     has_structural = False
     if accel_vib and accel_vib.get("score", 100) < 70:
@@ -6963,7 +6998,7 @@ def generate_tuning_recipe(noise_results, noise_fp, config, profile, accel_vib=N
         reasoning.append(f"RPM filter active — gyro LPF can go higher ({target_gyro}Hz) for less delay")
         reasoning.append(f"D-term PT3 at {target_dterm}Hz — smooth D without excessive lag")
 
-    elif has_prop_harmonics and not rpm_enabled:
+    elif has_prop_harmonics and not rpm_enabled and worst_recipe_dps >= NOISE_AMPLITUDE_OK_DPS:
         # Strong prop harmonics, no RPM filter — rely on dynamic notch + tight LPF
         recipe_name = "Harmonic Defense"
         description = ("Strong prop/motor harmonics without RPM filter. Dynamic notch tracks "
