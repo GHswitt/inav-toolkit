@@ -19,7 +19,7 @@ Usage:
 import sqlite3
 from datetime import datetime
 
-VERSION = "2.23.15"
+VERSION = "2.23.16"
 
 SCHEMA_VERSION = 1
 
@@ -351,6 +351,23 @@ class FlightDB:
 
         return history
 
+    # Mirrors flight_confidence() in blackbox_analyzer; duplicated rather than
+    # imported to keep this module free of that dependency.
+    CONFIDENCE_LOW_S = 60.0
+    CONFIDENCE_GOOD_S = 180.0
+
+    @staticmethod
+    def _confidence(duration_s):
+        try:
+            d = float(duration_s or 0)
+        except (TypeError, ValueError):
+            d = 0.0
+        if d < FlightDB.CONFIDENCE_LOW_S:
+            return "low", 0.3
+        if d < FlightDB.CONFIDENCE_GOOD_S:
+            return "limited", 0.7
+        return "good", 1.0
+
     def get_progression(self, craft, limit=10):
         """Get a progression summary for a craft.
 
@@ -386,14 +403,27 @@ class FlightDB:
                 "osc": f["osc_score"],
                 "verdict": f["verdict"],
                 "duration": f["duration_s"],
+                "confidence": self._confidence(f["duration_s"])[0],
+                "confidence_weight": self._confidence(f["duration_s"])[1],
                 "axes": f["axes"],
             })
 
-        # Determine trend
+        # Determine trend. A 56 s flight and a 523 s flight are not comparable
+        # evidence: the short one has fewer step events and less hover, so a single
+        # manoeuvre moves its score. Compare flights that carry enough log, and if
+        # the most recent is too short, say so instead of declaring a direction
+        # from it.
         changes = []
-        if len(simplified) >= 2:
-            prev = simplified[-2]
-            curr = simplified[-1]
+        solid = [f for f in simplified if f["confidence"] != "low"]
+        if len(simplified) >= 2 and len(solid) < 2:
+            return {"flights": simplified, "trend": "insufficient",
+                    "changes": [{"type": "low_confidence",
+                                 "text": "Not enough long flights to judge a trend - "
+                                         f"{len(solid)} of {len(simplified)} are over "
+                                         f"{self.CONFIDENCE_LOW_S:.0f}s"}]}
+        if len(solid) >= 2:
+            prev = solid[-2]
+            curr = solid[-1]
             delta = (curr["score"] or 0) - (prev["score"] or 0)
 
             if delta > 10:

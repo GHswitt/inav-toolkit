@@ -5,6 +5,38 @@ All notable changes to this fork, relative to the verbatim upstream import.
 Format: each entry corresponds to one commit. See `git log` for full reasoning and the
 measurements behind each change.
 
+## [2.23.16] — 2026-09-28
+
+### Added
+
+- **Flight duration now carries a confidence label, and short flights no longer drive trends.**
+  Scores were compared across flights of 56 s and 523 s as if they were equal evidence. A short
+  log has fewer step events, less throttle variety and less hover, so a single manoeuvre moves
+  its score — and on one craft the 56 s flight sat at the top of the table with the best overall
+  score of seven.
+
+  `flight_confidence()` labels a flight **low** (<60 s), **limited** (<180 s) or **good**, with a
+  weight for aggregation. The label and `duration_s` are stored in the scores dict and surfaced
+  as an info item on short flights. **A flight's own scores are never altered** — they are what
+  they are — only labelled.
+
+  `FlightDB.get_progression()` now computes the trend from flights that are not low-confidence,
+  and when there are fewer than two of those it reports `insufficient` with an explanation rather
+  than declaring a direction from short flights.
+
+### Fixed
+
+- The trend tests built synthetic flights of **2–5 seconds** and asserted a trend direction, so
+  they never exercised the logic they were written for. Lengthened to 200 s+, with new tests
+  pinning that short flights yield `insufficient` and that the confidence bands match the real
+  logs (56 s low, 135 s limited, 417 s good).
+
+### Known
+
+- Rejecting one bad P-frame in 2.23.15 changed `total_frames` by one, and the flight DB dedups on
+  `(craft, total_frames, duration, firmware)` — so re-analysing a log already in the DB inserts a
+  **duplicate row** rather than updating. LOG00002 currently appears twice.
+
 ## [2.23.15] — 2026-09-28
 
 ### Fixed

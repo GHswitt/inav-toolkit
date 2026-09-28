@@ -104,7 +104,7 @@ def _disable_colors():
 AXIS_NAMES = ["Roll", "Pitch", "Yaw"]
 AXIS_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D"]
 MOTOR_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D", "#A78BFA"]
-REPORT_VERSION = "2.23.15"
+REPORT_VERSION = "2.23.16"
 
 # ─── Frame and Prop Profiles ─────────────────────────────────────────────────
 # Two separate concerns:
@@ -6276,6 +6276,32 @@ def generate_nav_html_section(nav_results):
     return "\n".join(html_parts)
 
 
+# A short flight yields fewer step events, less varied throttle and less hover, so
+# its scores are noisier -- yet a 56 s log and a 523 s log were weighted alike in
+# the trend and sat side by side in the flight table. These bounds are about
+# sample size, not flight quality: below 60 s a single manoeuvre can move the
+# score materially, and the step-response analysis already declines to run on
+# under 10 s of Acro (MIN_ACRO_SECONDS_FOR_STEPS).
+FLIGHT_CONFIDENCE_LOW_S = 60.0
+FLIGHT_CONFIDENCE_GOOD_S = 180.0
+
+
+def flight_confidence(duration_s):
+    """('low'|'limited'|'good', weight) for a flight of this length.
+
+    The weight is for cross-flight aggregation; a single flight's own scores are
+    reported unmodified, only labelled."""
+    try:
+        d = float(duration_s or 0)
+    except (TypeError, ValueError):
+        d = 0.0
+    if d < FLIGHT_CONFIDENCE_LOW_S:
+        return "low", 0.3
+    if d < FLIGHT_CONFIDENCE_GOOD_S:
+        return "limited", 0.7
+    return "good", 1.0
+
+
 def generate_action_plan(noise_results, pid_results, motor_analysis, dterm_results,
                           config, data, profile=None, phase_lag=None, motor_response=None,
                           rpm_range=None, prop_harmonics=None, hover_osc=None):
@@ -6296,6 +6322,9 @@ def generate_action_plan(noise_results, pid_results, motor_analysis, dterm_resul
                 "overall": None, "noise": None, "pid": None,
                 "pid_measurable": False, "gyro_oscillation": None,
                 "hover_osc": hover_osc or [], "motor": None,
+                "duration_s": round(float(duration), 1),
+                "confidence": flight_confidence(duration)[0],
+                "confidence_weight": flight_confidence(duration)[1],
             },
             "verdict": "GROUND_ONLY",
             "verdict_text": ("Motors were at idle throughout this log - the quad was armed "
@@ -6824,6 +6853,23 @@ def generate_action_plan(noise_results, pid_results, motor_analysis, dterm_resul
         verdict, vtext = "NEEDS_WORK", t("verdict.needs_work")
     else:
         verdict, vtext = "ROUGH", t("verdict.rough")
+
+    # Label every flight with how much log it was measured on. The scores are not
+    # altered -- a short flight's numbers are what they are -- but anything
+    # aggregating across flights should down-weight them, and a reader comparing
+    # rows in a table deserves to see that one of them is 56 s and another 523 s.
+    _conf, _w = flight_confidence(duration)
+    scores["duration_s"] = round(float(duration), 1)
+    scores["confidence"] = _conf
+    scores["confidence_weight"] = _w
+    if _conf != "good":
+        info_items.append({
+            "title": f"Short flight ({duration:.0f}s) - scores are {_conf}-confidence",
+            "detail": (f"Below {FLIGHT_CONFIDENCE_GOOD_S:.0f}s there are fewer step events, "
+                       "less throttle variety and less hover, so a single manoeuvre moves the "
+                       "score. Treat this flight as indicative and weight longer logs more "
+                       "heavily when comparing."),
+        })
 
     return {"actions": actions, "info": info_items, "scores": scores, "verdict": verdict, "verdict_text": vtext}
 

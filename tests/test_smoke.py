@@ -495,7 +495,11 @@ class TestTrendAnalysis:
                 }
                 config = {"craft_name": "TEST_QUAD", "_duration_s": 120 + i * 10,
                           "_n_motors": 4, "looptime": "1000"}
-                data = {"sample_rate": 500.0, "time_s": np.arange(1000 + i * 500) / 500.0}
+                # 200 s+ per flight: below 60 s get_progression reports
+                # "insufficient" by design, so a 2 s fixture never exercised the
+                # trend logic these tests were written for.
+                data = {"sample_rate": 500.0,
+                        "time_s": np.arange(100000 + i * 500) / 500.0}
                 hover_osc = [
                     {"axis": "Roll", "severity": "low", "gyro_rms": 3.0 - i * 0.3, "gyro_p2p": 8.0},
                     {"axis": "Pitch", "severity": "low", "gyro_rms": 2.8 - i * 0.2, "gyro_p2p": 7.0},
@@ -505,7 +509,40 @@ class TestTrendAnalysis:
             prog = db.get_progression("TEST_QUAD")
             assert prog["trend"] in ("improving", "stable"), f"Got: {prog}"
             assert len(prog["flights"]) >= 2
+            assert all(f["confidence"] == "good" for f in prog["flights"])
             db.close()
+
+    def test_short_flights_do_not_drive_a_trend(self):
+        """A 56 s log has fewer step events and less hover than a 523 s one, so a
+        direction must not be declared from short flights alone."""
+        import tempfile
+        from inav_toolkit.flight_db import FlightDB
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = FlightDB(os.path.join(tmpdir, "short.db"))
+            for i, score in enumerate((55, 75)):
+                plan = {"scores": {"overall": score, "noise": score, "pid": score,
+                                   "pid_measurable": True, "motor": 80,
+                                   "gyro_oscillation": score},
+                        "verdict": "OK", "verdict_text": "t", "actions": [],
+                        "noise_fingerprint": {"peaks": [], "dominant_source": "clean",
+                                              "summary": ""}}
+                config = {"craft_name": "SHORTY", "_n_motors": 4, "looptime": "1000"}
+                # distinct lengths: the DB dedups on (craft, frames, duration)
+                data = {"sample_rate": 500.0,
+                        "time_s": np.arange(15000 + i * 2000) / 500.0}   # 30 s, 34 s
+                db.store_flight(plan, config, data)
+            prog = db.get_progression("SHORTY")
+            assert prog["trend"] == "insufficient"
+            assert all(f["confidence"] == "low" for f in prog["flights"])
+            assert any(c.get("type") == "low_confidence" for c in prog["changes"])
+            db.close()
+
+    def test_confidence_bands(self):
+        from inav_toolkit.blackbox_analyzer import flight_confidence
+        assert flight_confidence(56)[0] == "low"
+        assert flight_confidence(135)[0] == "limited"
+        assert flight_confidence(417)[0] == "good"
+        assert flight_confidence(56)[1] < flight_confidence(417)[1]
 
     def test_generate_trend_html(self):
         """Test HTML trend report generation."""
@@ -530,7 +567,11 @@ class TestTrendAnalysis:
                 }
                 config = {"craft_name": "TEST_QUAD", "_duration_s": 120 + i * 30,
                           "_n_motors": 4, "looptime": "1000"}
-                data = {"sample_rate": 500.0, "time_s": np.arange(1000 + i * 500) / 500.0}
+                # 200 s+ per flight: below 60 s get_progression reports
+                # "insufficient" by design, so a 2 s fixture never exercised the
+                # trend logic these tests were written for.
+                data = {"sample_rate": 500.0,
+                        "time_s": np.arange(100000 + i * 500) / 500.0}
                 hover_osc = [
                     {"axis": "Roll", "severity": "low", "gyro_rms": 3.0 - i * 0.2, "gyro_p2p": 8.0},
                     {"axis": "Pitch", "severity": "low", "gyro_rms": 2.8 - i * 0.15, "gyro_p2p": 7.0},
