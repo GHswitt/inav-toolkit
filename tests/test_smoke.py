@@ -2433,3 +2433,40 @@ class TestNoiseScoreCalibration:
         src = inspect.getsource(B)
         i = src.index("dps = nr.get(\"rms_high_dps\")")
         assert "else:" in src[i:i + 700] and "rms_high" in src[i:i + 700]
+
+    def test_rpm_filter_not_recommended_on_a_quiet_craft(self):
+        """Its only condition used to be "the filter is off", so it fired on every
+        log -- including one at 96/100 noise whose dominant source was propwash,
+        which an RPM filter cannot touch, on a craft that had already flown the
+        experiment and measured ~0 dB benefit."""
+        from inav_toolkit.blackbox_analyzer import (generate_action_plan,
+                                                    get_frame_profile,
+                                                    NOISE_AMPLITUDE_OK_DPS)
+        prof = get_frame_profile(7)
+
+        def plan_for(dps, source):
+            nr = [{"axis": a, "rms_high": -25.0, "rms_high_dps": dps,
+                   "rms_low": -20.0, "rms_mid": -22.0,
+                   "peaks": [{"freq_hz": 300.0, "power_db": -15.0, "prominence": 9.0}],
+                   "freqs": np.array([0.0, 300.0]), "psd_db": np.array([-60.0, -15.0]),
+                   "noise_start_freq": 300.0} for a in ("Roll", "Pitch", "Yaw")]
+            fp = {"peaks": [{"freq_hz": 300.0, "power_db": -15.0, "source": source,
+                             "axes": ["Roll"], "n_axes": 1, "prominence": 9.0}],
+                  "dominant_source": source, "summary": ""}
+            data = {"time_s": np.arange(300000) / 1000.0, "sample_rate": 1000.0}
+            cfg = {"_n_motors": 4, "rpm_filter_enabled": "OFF",
+                   "dyn_notch_enabled": "ON", "dyn_notch_min_hz": 60,
+                   "gyro_main_lpf_hz": 90}
+            return generate_action_plan(nr, [None]*3, None, None, cfg, data,
+                                        prof, noise_fp=fp)
+
+        def has_rpm(plan):
+            return any("rpm_gyro_filter_enabled" in str(a.get("action", ""))
+                       for a in plan["actions"])
+
+        # quiet craft, rotational source -> no recommendation
+        assert not has_rpm(plan_for(NOISE_AMPLITUDE_OK_DPS - 1.0, "prop_harmonics"))
+        # loud but aerodynamic -> RPM filter cannot help, so no recommendation
+        assert not has_rpm(plan_for(NOISE_AMPLITUDE_OK_DPS + 10.0, "propwash"))
+        # loud and rotational -> recommend it
+        assert has_rpm(plan_for(NOISE_AMPLITUDE_OK_DPS + 10.0, "prop_harmonics"))

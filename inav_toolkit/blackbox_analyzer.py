@@ -104,7 +104,7 @@ def _disable_colors():
 AXIS_NAMES = ["Roll", "Pitch", "Yaw"]
 AXIS_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D"]
 MOTOR_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D", "#A78BFA"]
-REPORT_VERSION = "2.23.18"
+REPORT_VERSION = "2.23.19"
 
 # ─── Frame and Prop Profiles ─────────────────────────────────────────────────
 # Two separate concerns:
@@ -6327,7 +6327,8 @@ def flight_confidence(duration_s):
 
 def generate_action_plan(noise_results, pid_results, motor_analysis, dterm_results,
                           config, data, profile=None, phase_lag=None, motor_response=None,
-                          rpm_range=None, prop_harmonics=None, hover_osc=None):
+                          rpm_range=None, prop_harmonics=None, hover_osc=None,
+                          noise_fp=None):
     actions = []
     if profile is None:
         profile = get_frame_profile(5)
@@ -6618,12 +6619,31 @@ def generate_action_plan(noise_results, pid_results, motor_analysis, dterm_resul
                     "param": "dyn_notch_min_hz", "current": int(dyn_min_hz), "new": rec_min_hz,
                     "reason": f"Noise peak at {int(lowest_peak)}Hz is near/below current min_hz ({int(dyn_min_hz)}Hz) - notch can't track it"})
 
-        # RPM filter recommendation (more effective than dynamic notch for motor noise)
-        if rpm_en in (None, "0", 0, "OFF"):
+        # RPM filter recommendation. The only condition used to be "the filter is
+        # off", so it fired on every log regardless of whether there was noise to
+        # remove or whether the noise was of a kind an RPM filter can address. On
+        # one craft it was recommended while the cited dominant source was
+        # *propwash at 44 Hz* -- aerodynamic, and untouchable by a filter that
+        # tracks motor rotation -- on a flight scoring 96/100 for noise. That craft
+        # had also already flown the experiment: with RPM ON and live telemetry the
+        # attenuation at its own target band changed by ~0 dB on roll and 2.6 dB on
+        # pitch.
+        #
+        # So require both that the noise is worth removing, and that it is
+        # rotational in origin.
+        _rpm_dps = max((nr.get("rms_high_dps", 0.0) for nr in noise_results if nr),
+                       default=0.0)
+        _rpm_worth_it = _rpm_dps >= NOISE_AMPLITUDE_OK_DPS
+        _rotational = any(p.get("source") in ("prop_harmonics", "motor_imbalance",
+                                              "motor_noise", "bearing_wear")
+                          for p in (noise_fp or {}).get("peaks", []))
+        if rpm_en in (None, "0", 0, "OFF") and _rpm_worth_it and _rotational:
             actions.append({"priority": 4, "urgency": "OPTIONAL", "category": "Filter",
                     "action": "Consider enabling RPM filter (set rpm_gyro_filter_enabled = ON)",
                     "param": "rpm_filter_enabled", "current": "OFF", "new": "ON",
-                    "reason": "RPM filter tracks motor noise precisely - requires ESC telemetry wire connected to a UART"})
+                    "reason": f"RPM filter tracks motor noise precisely ({_rpm_dps:.1f} deg/s "
+                              "of rotational noise present) - requires ESC telemetry wire "
+                              "connected to a UART"})
 
     # ═══ PID CHANGES (merged per axis) ═══
     for i, axis in enumerate(AXIS_NAMES):
@@ -12684,7 +12704,7 @@ def _analyze_for_compare(logfile, args, config_raw=None):
 
     plan = generate_action_plan(noise_results, pid_results, motor_analysis, dterm_results,
                                 config, data, profile, phase_lag, motor_response,
-                                rpm_range, prop_harmonics, hover_osc)
+                                rpm_range, prop_harmonics, hover_osc, noise_fp=noise_fp)
     plan["noise_fingerprint"] = noise_fp
 
     return {
@@ -13868,7 +13888,7 @@ def _analyze_single_log(logfile, args, config_raw=None, summary_only=False):
 
     plan = generate_action_plan(noise_results, pid_results, motor_analysis, dterm_results,
                                  config, data, profile, phase_lag, motor_response,
-                                 rpm_range, prop_harmonics, hover_osc)
+                                 rpm_range, prop_harmonics, hover_osc, noise_fp=noise_fp)
     plan["noise_fingerprint"] = noise_fp
 
     # Enrich filter action reasons with noise source identification

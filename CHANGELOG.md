@@ -5,6 +5,26 @@ All notable changes to this fork, relative to the verbatim upstream import.
 Format: each entry corresponds to one commit. See `git log` for full reasoning and the
 measurements behind each change.
 
+## [2.23.19] — 2026-09-28
+
+### Fixed
+
+- **"Consider enabling RPM filter" was recommended on every log.** Its only condition was that
+  the filter is off — no check on whether there was noise worth removing, whether the noise was
+  of a kind an RPM filter can address, or whether ESC telemetry exists. On one flight it was
+  recommended while the noise score was **96/100** (1.7 deg/s above 300 Hz) and the dominant
+  source it cited in its own reason string was **propwash at 44 Hz**, which is aerodynamic and
+  cannot be tracked by a filter that follows motor rotation.
+
+  That craft had also already flown the experiment: with RPM **ON** and live telemetry at
+  ~8000 RPM, attenuation at the filter's own target band changed by **~0 dB on roll and 2.6 dB on
+  pitch** against RPM off.
+
+  Now requires the noise amplitude to reach `NOISE_AMPLITUDE_OK_DPS` **and** a rotational source
+  to be present (`prop_harmonics`, `motor_imbalance`, `motor_noise`, `bearing_wear`).
+  `generate_action_plan()` takes `noise_fp` so it can see the classification. Tests pin all three
+  cases: quiet + rotational → no, loud + propwash → no, loud + rotational → yes.
+
 ## [2.23.18] — 2026-09-28
 
 ### Changed
