@@ -5,6 +5,19 @@ All notable changes to this fork, relative to the verbatim upstream import.
 Format: each entry corresponds to one commit. See `git log` for full reasoning and the
 measurements behind each change.
 
+## [2.23.24] — 2026-09-29
+
+### Changed
+
+- **Altitude-hold findings quote p99 instead of the raw maximum**, in all four reporting sites
+  (two finding texts, the terminal line, the HTML table). A **29 ms transient** at the instant
+  the altitude target re-latches was headlining **711 cm** beside a **48 cm RMS** — 0.03 % of
+  held time, against p95 106 cm and p99 156 cm. 2.23.21 added the percentiles to the data but
+  left every display reading the extreme.
+
+  `Altitude hold: RMS 47cm, p99 156cm (90s)` replaces `RMS 48cm, max 711cm`. `max_error_cm` is
+  still in the data for anyone who wants it.
+
 ## [2.23.23] — 2026-09-29
 
 ### Fixed

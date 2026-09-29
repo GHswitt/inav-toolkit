@@ -104,7 +104,7 @@ def _disable_colors():
 AXIS_NAMES = ["Roll", "Pitch", "Yaw"]
 AXIS_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D"]
 MOTOR_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D", "#A78BFA"]
-REPORT_VERSION = "2.23.23"
+REPORT_VERSION = "2.23.24"
 
 # ─── Frame and Prop Profiles ─────────────────────────────────────────────────
 # Two separate concerns:
@@ -5988,20 +5988,20 @@ def analyze_nav_performance(data, sr, config=None, profile=None):
                 findings.append({
                     "level": "WARNING",
                     "text": f"Altitude oscillation at {z_osc_freq:.1f}Hz "
-                            f"(RMS {rms_z:.0f}cm, max {max_z:.0f}cm)",
+                            f"(RMS {rms_z:.0f}cm, p99 {p99_z:.0f}cm)",
                     "detail": "Altitude is bobbing. Reduce nav_mc_vel_z_p or nav_mc_pos_z_p."
                 })
             elif max_z > 200:
                 score -= 10
                 findings.append({
                     "level": "INFO",
-                    "text": f"Altitude hold: RMS {rms_z:.0f}cm, max {max_z:.0f}cm ({hold_dur:.0f}s)",
+                    "text": f"Altitude hold: RMS {rms_z:.0f}cm, p99 {p99_z:.0f}cm ({hold_dur:.0f}s)",
                     "detail": "Some altitude wander. Check baro seal and nav Z gains."
                 })
             else:
                 findings.append({
                     "level": "OK",
-                    "text": f"Altitude hold: RMS {rms_z:.0f}cm, max {max_z:.0f}cm — good",
+                    "text": f"Altitude hold: RMS {rms_z:.0f}cm, p99 {p99_z:.0f}cm — good",
                     "detail": ""
                 })
 
@@ -8422,7 +8422,10 @@ def _print_section_nav(nav_perf):
     if ah:
         alt_c = G if ah["rms_error_cm"] < 50 else Y if ah["rms_error_cm"] < 150 else RED
         print(f"\n  {B}Altitude hold ({ah['hold_duration_s']:.0f}s):{R}")
-        print(f"    RMS: {alt_c}{ah['rms_error_cm']:.0f}cm{R}  Max: {ah['max_error_cm']:.0f}cm")
+        # p99 rather than the raw maximum: a 29 ms transient at the moment the
+        # altitude target re-latches was headlining 711cm against a 48cm RMS.
+        print(f"    RMS: {alt_c}{ah['rms_error_cm']:.0f}cm{R}  "
+              f"p95: {ah.get('p95_error_cm', 0):.0f}cm  p99: {ah.get('p99_error_cm', 0):.0f}cm")
         if ah.get("oscillation"):
             print(f"    {Y}Oscillation at {ah['osc_freq_hz']:.1f}Hz{R}")
 
@@ -9968,7 +9971,8 @@ def _generate_nav_perf_html(nav_perf):
         html += f'<div class="cc"><h3>Altitude Hold ({ah["hold_duration_s"]:.0f}s)</h3>'
         html += f'<table><tr><th>Metric</th><th>Value</th></tr>'
         html += f'<tr><td>RMS error</td><td class="{alt_c}">{ah["rms_error_cm"]:.0f}cm</td></tr>'
-        html += f'<tr><td>Max error</td><td>{ah["max_error_cm"]:.0f}cm</td></tr>'
+        html += (f'<tr><td>Error p95 / p99</td>'
+                 f'<td>{ah.get("p95_error_cm", 0):.0f}cm / {ah.get("p99_error_cm", 0):.0f}cm</td></tr>')
         if ah.get("oscillation"):
             html += f'<tr><td>Oscillation</td><td class="warn">{ah["osc_freq_hz"]:.1f}Hz</td></tr>'
         html += '</table></div>'

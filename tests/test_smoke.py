@@ -2639,3 +2639,15 @@ class TestNoTransformsAcrossGaps:
         roll = [r for r in (res or []) if r.get("axis") == "Roll"][0]
         assert roll["gyro_p2p"] < 20, roll["gyro_p2p"]        # ~8.5 for a 3 deg/s sine
         assert roll["gyro_p2p_max"] > 200, roll["gyro_p2p_max"]  # extreme still kept
+
+    def test_altitude_findings_quote_p99_not_the_extreme(self):
+        """A 29 ms transient at the target re-latch was headlining 711cm against a
+        48cm RMS. Percentiles describe the hold; the extreme describes one sample."""
+        import inspect
+        from inav_toolkit import blackbox_analyzer as B
+        src = inspect.getsource(B)
+        i = src.index('"text": f"Altitude hold: RMS')
+        block = src[i:i + 400]
+        assert "p99" in block and "max {max_z" not in block, block[:200]
+        j = src.index('"text": f"Altitude oscillation at')
+        assert "p99" in src[j:j + 300], src[j:j + 200]
