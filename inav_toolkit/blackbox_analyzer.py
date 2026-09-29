@@ -104,7 +104,7 @@ def _disable_colors():
 AXIS_NAMES = ["Roll", "Pitch", "Yaw"]
 AXIS_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D"]
 MOTOR_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D", "#A78BFA"]
-REPORT_VERSION = "2.23.25"
+REPORT_VERSION = "2.23.26"
 
 # ─── Frame and Prop Profiles ─────────────────────────────────────────────────
 # Two separate concerns:
@@ -6525,6 +6525,24 @@ def generate_action_plan(noise_results, pid_results, motor_analysis, dterm_resul
             freq = osc["dominant_freq_hz"]
             cause = osc["cause"]
             sev = osc["severity"]
+
+            # A "mild" hover oscillation is not grounds for a filter change. For a
+            # 7-inch the bands are none < 2.0 and mild < 5.0 deg/s RMS, so "mild"
+            # begins 33 % above "nothing to see" -- and one flight at 2.67 deg/s
+            # produced "reduce D-term LPF from 80Hz to 48Hz, D from 40 to 28",
+            # which costs real phase margin. 2.23.12 set 4 deg/s as the point below
+            # which filtering is not the limiting factor; the same bar applies
+            # here. The measurement is still reported, as an observation.
+            if sev == "mild" and (osc.get("gyro_rms") or 0) < NOISE_AMPLITUDE_OK_DPS:
+                _f = osc.get("dominant_freq_hz")
+                info_items.append({
+                    "text": (f"{osc['axis']}: mild hover oscillation ({rms:.1f}°/s RMS"
+                             + (f" at ~{_f:.0f}Hz" if _f else "") + ")"),
+                    "detail": (f"Below {NOISE_AMPLITUDE_OK_DPS:.0f}°/s RMS filtering is not the "
+                               "limiting factor, and tightening it costs phase margin. Reported "
+                               "so it can be watched, not acted on."),
+                })
+                continue
 
             urg = "CRITICAL" if sev == "severe" else "IMPORTANT" if sev == "moderate" else "RECOMMENDED"
             prio = 0 if sev == "severe" else 1  # Priority 0 = above everything else

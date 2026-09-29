@@ -2687,3 +2687,26 @@ class TestPidAdviceNeedsEvidence:
     def test_a_long_span_still_gives_advice(self):
         plan = self._plan(acro_s=211.0, n_steps=32)
         assert self._pid_actions(plan), "long span should still recommend"
+
+    def test_mild_hover_oscillation_is_reported_not_actioned(self):
+        """2.67 deg/s RMS produced "reduce D-term LPF 80->48, D 40->28"."""
+        from inav_toolkit.blackbox_analyzer import generate_action_plan, get_frame_profile
+        prof = get_frame_profile(7)
+        data = {"time_s": np.arange(300000) / 1000.0, "sample_rate": 1000.0}
+        cfg = {"_n_motors": 4, "roll_p": 53, "roll_d": 40, "roll_ff": 187,
+               "dterm_lpf_hz": 80}
+
+        def plan(rms, sev):
+            osc = [{"axis": "Roll", "severity": sev, "gyro_rms": rms, "gyro_p2p": 21.0,
+                    "gyro_p2p_max": 212.0, "dominant_freq_hz": 38.0, "cause": "D_noise",
+                    "hover_seconds": 93.0, "peak_prominence": 4.3}]
+            return generate_action_plan([None]*3, [None]*3, None, None, cfg, data,
+                                        prof, hover_osc=osc)
+
+        mild = plan(2.67, "mild")
+        assert not any("dterm" in str(a.get("param", "")).lower()
+                       for a in mild["actions"]), mild["actions"]
+        assert any("mild hover oscillation" in i.get("text", "")
+                   for i in mild["info"]), mild["info"]
+        loud = plan(9.0, "moderate")
+        assert loud["actions"], "a moderate oscillation must still act"

@@ -5,6 +5,25 @@ All notable changes to this fork, relative to the verbatim upstream import.
 Format: each entry corresponds to one commit. See `git log` for full reasoning and the
 measurements behind each change.
 
+## [2.23.26] — 2026-09-29
+
+### Fixed
+
+- **A "mild" hover oscillation generated a filter change.** For a 7-inch the bands are
+  `none < 2.0`, `mild < 5.0` deg/s RMS, so "mild" begins only 33 % above "nothing to see" — and
+  a flight at **2.67 deg/s RMS** produced `reduce D-term LPF from 80Hz to 48Hz, D from 40 to 28`,
+  which costs real phase margin. 2.23.12 established 4 deg/s as the point below which filtering
+  is not the limiting factor; the same bar now applies here. The measurement is still reported as
+  an observation. A moderate oscillation still acts — there is a test for both.
+
+### Note
+
+- The 38 Hz on that flight is **real** and survives the hover-FFT fix in 2.23.22
+  (`dominant_freq_hz = 38.3`, prominence 4.3 against a threshold of 3). An earlier claim in
+  conversation that it had become `None` was wrong: it came from reading a key name that does not
+  exist (`gyro_freq_hz` rather than `dominant_freq_hz`), so `.get()` returned None. The frequency
+  is genuine; it is the *amplitude* that does not justify acting.
+
 ## [2.23.25] — 2026-09-29
 
 ### Fixed
