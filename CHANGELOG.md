@@ -5,6 +5,29 @@ All notable changes to this fork, relative to the verbatim upstream import.
 Format: each entry corresponds to one commit. See `git log` for full reasoning and the
 measurements behind each change.
 
+## [2.23.25] — 2026-09-29
+
+### Fixed
+
+- **PID advice was generated from as little as 12 s of Acro.** `MIN_ACRO_SECONDS_FOR_STEPS` (10 s)
+  is the bar for *computing* a step-response figure; acting on one needs more. The same aircraft,
+  with **identical PIDs** (P=53, D=40, FF=187), measured roll overshoot of:
+
+  | Acro span | steps | roll overshoot | pitch overshoot |
+  |---|---|---|---|
+  | 334 s | 31 | **7.5 %** | 6.1 % |
+  | 211 s | 32 | **15.0 %** | 13.3 % |
+  | **12 s** | ~11 | **48.6 %** | **63.6 %** |
+
+  The figure rises monotonically as the span shrinks — the estimate degrading, not the tune
+  changing. On that 12 s flight it produced `Reduce FF 187→142, Reduce P 53→49, Increase D 40→48`
+  marked IMPORTANT, on an aircraft the pilot reported as flying well.
+
+  PID actions now require `MIN_ACRO_SECONDS_FOR_ADVICE` (60 s) **and** `MIN_STEPS_FOR_PID_ADVICE`
+  (20). Below either, the measurement is still reported and an info item explains why it is not
+  being acted on, quoting the three spans above. A 211 s / 32-step flight still gets advice —
+  there is a test for that, so this is a bar rather than a mute.
+
 ## [2.23.24] — 2026-09-29
 
 ### Changed

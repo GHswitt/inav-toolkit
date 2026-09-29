@@ -2651,3 +2651,39 @@ class TestNoTransformsAcrossGaps:
         assert "p99" in block and "max {max_z" not in block, block[:200]
         j = src.index('"text": f"Altitude oscillation at')
         assert "p99" in src[j:j + 300], src[j:j + 200]
+
+
+class TestPidAdviceNeedsEvidence:
+    """Overshoot on a short Acro span is not grounds for a PID change."""
+
+    def _plan(self, acro_s, n_steps, overshoot=49.0):
+        from inav_toolkit.blackbox_analyzer import generate_action_plan, get_frame_profile
+        prof = get_frame_profile(7)
+        pid = [{"axis": a, "avg_overshoot_pct": overshoot, "tracking_delay_ms": 30.0,
+                "rms_error": 3.6, "n_steps": n_steps, "acro_seconds": acro_s,
+                "setpoint_source": "axisRate", "mode_filtered": True,
+                "pid_stats": {"P": {"rms": 20.0}, "I": {"rms": 30.0}, "D": {"rms": 10.0}},
+                "setpoint": np.zeros(10), "gyro": np.zeros(10)}
+               for a in ("Roll", "Pitch", "Yaw")]
+        cfg = {"_n_motors": 4, "roll_p": 53, "roll_i": 95, "roll_d": 40, "roll_ff": 187,
+               "pitch_p": 53, "pitch_i": 95, "pitch_d": 47, "pitch_ff": 185,
+               "yaw_p": 53, "yaw_i": 95, "yaw_d": 12, "yaw_ff": 187}
+        data = {"time_s": np.arange(300000) / 1000.0, "sample_rate": 1000.0}
+        return generate_action_plan([None]*3, pid, None, None, cfg, data, prof)
+
+    def _pid_actions(self, plan):
+        return [a for a in plan["actions"]
+                if any(k in str(a.get("param", "")) for k in ("_p", "_d", "_ff", "_i"))]
+
+    def test_twelve_seconds_of_acro_gives_no_pid_advice(self):
+        plan = self._plan(acro_s=12.0, n_steps=11)
+        assert not self._pid_actions(plan), self._pid_actions(plan)
+
+    def test_it_says_why_instead_of_staying_silent(self):
+        plan = self._plan(acro_s=12.0, n_steps=11)
+        assert any("too little to tune from" in i.get("text", "")
+                   for i in plan["info"]), plan["info"]
+
+    def test_a_long_span_still_gives_advice(self):
+        plan = self._plan(acro_s=211.0, n_steps=32)
+        assert self._pid_actions(plan), "long span should still recommend"

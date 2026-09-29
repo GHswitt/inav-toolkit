@@ -104,7 +104,7 @@ def _disable_colors():
 AXIS_NAMES = ["Roll", "Pitch", "Yaw"]
 AXIS_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D"]
 MOTOR_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D", "#A78BFA"]
-REPORT_VERSION = "2.23.24"
+REPORT_VERSION = "2.23.25"
 
 # ─── Frame and Prop Profiles ─────────────────────────────────────────────────
 # Two separate concerns:
@@ -3733,6 +3733,11 @@ def flight_mode_breakdown(data, sr):
 # step statistics from a handful of stick movements.
 MIN_ACRO_SECONDS_FOR_STEPS = 10.0
 
+# Computing a step-response figure is one bar; recommending a PID change from it
+# is a higher one. See the note at the PID action loop for the measurements.
+MIN_ACRO_SECONDS_FOR_ADVICE = 60.0
+MIN_STEPS_FOR_PID_ADVICE = 20
+
 
 def analyze_pid_response(data, axis_idx, sr):
     axis = AXIS_NAMES[axis_idx]
@@ -6787,9 +6792,30 @@ def generate_action_plan(noise_results, pid_results, motor_analysis, dterm_resul
                               "connected to a UART"})
 
     # ═══ PID CHANGES (merged per axis) ═══
+    # Step-response advice needs enough steps to be a measurement rather than a
+    # sample of one manoeuvre. The same aircraft, with identical PIDs, measured
+    # roll overshoot of 7.5 % over 334 s of Acro, 15.0 % over 211 s and 48.6 % over
+    # 12 s: the figure rises monotonically as the span shrinks, because the
+    # estimate degrades, not because the tune changed. MIN_ACRO_SECONDS_FOR_STEPS
+    # (10 s) is the bar for *computing* a figure; acting on one needs more.
     for i, axis in enumerate(AXIS_NAMES):
         pid = pid_results[i] if i < len(pid_results) else None
         if pid is None:
+            continue
+        _steps = pid.get("n_steps") or 0
+        _acro = pid.get("acro_seconds") or 0
+        if _steps < MIN_STEPS_FOR_PID_ADVICE or _acro < MIN_ACRO_SECONDS_FOR_ADVICE:
+            if pid.get("avg_overshoot_pct") is not None:
+                info_items.append({
+                    "text": (f"{axis}: step response measured on {_acro:.0f}s of Acro "
+                             f"({_steps} steps) - too little to tune from"),
+                    "detail": (f"Overshoot reads {pid['avg_overshoot_pct']:.0f}%, but the same "
+                               f"craft can read very differently on a short span: one aircraft "
+                               f"with unchanged PIDs measured 7.5% over 334s, 15.0% over 211s "
+                               f"and 48.6% over 12s. Fly at least "
+                               f"{MIN_ACRO_SECONDS_FOR_ADVICE:.0f}s of Acro with varied stick "
+                               f"input before changing PIDs on this evidence."),
+                })
             continue
         cur_p = config.get(f"{axis.lower()}_p")
         cur_i = config.get(f"{axis.lower()}_i")
