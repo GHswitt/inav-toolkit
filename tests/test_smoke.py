@@ -2575,3 +2575,48 @@ class TestNavPerfDetectors:
         bowl = analyze_nav_performance(self._log(orbit=True), self.SR)
         assert not ((quiet or {}).get("poshold") or {}).get("toilet_bowl"), "false positive"
         assert ((bowl or {}).get("poshold") or {}).get("toilet_bowl"), "missed a real orbit"
+
+
+class TestNoTransformsAcrossGaps:
+    """diff/unwrap/FFT must never run on a stitched-together array."""
+
+    SR = 1000.0
+
+    def test_hover_fft_uses_one_segment(self):
+        """Two hover periods at DIFFERENT frequencies, concatenated, would show a
+        join transient and a blended spectrum."""
+        from inav_toolkit.blackbox_analyzer import detect_hover_oscillation, get_frame_profile
+        n = 60000
+        t = np.arange(n) / self.SR
+        sp = np.full(n, 300.0)            # stick away: not hover
+        gy = np.zeros(n)
+        # segment A: 20 s at 12 Hz, segment B: 20 s at 40 Hz, far apart
+        sp[2000:22000] = 0.0
+        gy[2000:22000] = 6.0 * np.sin(2*np.pi*12*t[2000:22000])
+        sp[38000:58000] = 0.0
+        gy[38000:58000] = 6.0 * np.sin(2*np.pi*40*t[38000:58000])
+        d = {"n_rows": n, "time_s": t,
+             "setpoint_roll": sp, "gyro_roll": gy,
+             "setpoint_pitch": sp, "gyro_pitch": np.zeros(n),
+             "setpoint_yaw": sp, "gyro_yaw": np.zeros(n)}
+        res = detect_hover_oscillation(d, self.SR, get_frame_profile(7))
+        roll = [r for r in (res or []) if r.get("axis") == "Roll"]
+        assert roll, res
+        f = roll[0].get("gyro_freq_hz")
+        # must be one of the two real tones, not a blend or a join artefact
+        assert f is None or abs(f - 12) < 3 or abs(f - 40) < 3, f
+
+    def test_position_jump_not_reported_across_a_nan_gap(self):
+        """np.diff(pos[valid]) joins both sides of a NaN stretch."""
+        from inav_toolkit.blackbox_analyzer import analyze_gps_quality
+        n = 40000
+        t = np.arange(n) / self.SR
+        pn = np.full(n, 1000.0)
+        pe = np.full(n, 2000.0)
+        pn[20000:22000] = np.nan          # 2 s of missing data
+        pe[20000:22000] = np.nan
+        pn[22000:] = 9000.0               # position legitimately differs after
+        pe[22000:] = 9000.0
+        d = {"n_rows": n, "time_s": t, "nav_pos_n": pn, "nav_pos_e": pe}
+        r = analyze_gps_quality(d, self.SR)
+        assert r.get("position_jumps", 0) == 0, r

@@ -5,6 +5,37 @@ All notable changes to this fork, relative to the verbatim upstream import.
 Format: each entry corresponds to one commit. See `git log` for full reasoning and the
 measurements behind each change.
 
+## [2.23.22] — 2026-09-29
+
+### Fixed
+
+Four instances of one defect: `np.diff`, `np.unwrap` or an FFT applied to an array assembled
+from non-contiguous pieces, where every join is read as signal. An audit of all 21
+diff/unwrap/gradient sites and every FFT found three beyond the one that prompted it.
+
+- **The corrected toilet-bowl test was fed stitched segments.** 2.23.21 replaced the detector in
+  `analyze_nav_performance` with revolution counting but left it reading `pos_n[poshold_mask]`.
+  One log's two hold segments (14 s and 15 s) produced a "toilet bowl" of **18.5 s period —
+  longer than either segment that supposedly contained it**. Now counts turns on the longest
+  unbroken run. Three real logs: one false positive → none.
+
+- **`detect_hover_oscillation` FFT'd a concatenation.** `hover_gyro = np.concatenate([gy[s:e] …])`
+  stitches separate hover periods and the transform ran on the result, so each join injected
+  broadband energy into the spectrum that determines the oscillation frequency and severity —
+  and the `gyro_oscillation` score. The transform now uses the longest single segment; RMS and
+  peak-to-peak still pool everything, since neither involves a derivative.
+
+- **`analyze_gps_quality` counted NaN gaps as position jumps.** `np.diff(pos_n[valid])` joins
+  both sides of a missing-data stretch, so a legitimate position change across a 2 s gap read as
+  a single-sample teleport.
+
+- **`analyze_position_hold`'s discontinuity check had the same flaw** — in code added by 2.23.7.
+
+### Known
+
+- `generate_charts` decimates heading with `hdg[::ds]` for display, the aliasing issue 2.23.6
+  fixed in the metric. Chart only; the reported figure is correct.
+
 ## [2.23.21] — 2026-09-29
 
 ### Fixed

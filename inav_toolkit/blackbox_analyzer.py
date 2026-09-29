@@ -104,7 +104,7 @@ def _disable_colors():
 AXIS_NAMES = ["Roll", "Pitch", "Yaw"]
 AXIS_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D"]
 MOTOR_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D", "#A78BFA"]
-REPORT_VERSION = "2.23.21"
+REPORT_VERSION = "2.23.22"
 
 # ─── Frame and Prop Profiles ─────────────────────────────────────────────────
 # Two separate concerns:
@@ -3391,12 +3391,19 @@ def detect_hover_oscillation(data, sr, profile=None):
         gyro_rms = float(np.sqrt(np.mean(hover_gyro ** 2)))
         gyro_p2p = float(np.max(hover_gyro) - np.min(hover_gyro))
 
-        # Dominant frequency via FFT
+        # Dominant frequency via FFT -- on ONE segment, never the concatenation.
+        # hover_gyro stitches separate hover periods together, and each join is a
+        # step discontinuity that injects broadband energy into the spectrum. RMS
+        # and peak-to-peak above are unaffected (no derivative, no transform), so
+        # they still pool every segment; only the transform needs continuity.
         dominant_freq = None
         peak_prominence = 0  # How much the peak stands out from noise floor
-        if len(hover_gyro) >= int(sr * 0.25):  # Need at least 0.25s for FFT
-            freqs = rfftfreq(len(hover_gyro), 1.0 / sr)
-            spectrum = np.abs(rfft(hover_gyro))
+        fft_seg = max(hover_segments, key=lambda se: se[1] - se[0])
+        fft_gyro = gy[fft_seg[0]:fft_seg[1]]
+        fft_gyro = fft_gyro - np.mean(fft_gyro)
+        if len(fft_gyro) >= int(sr * 0.25):  # Need at least 0.25s for FFT
+            freqs = rfftfreq(len(fft_gyro), 1.0 / sr)
+            spectrum = np.abs(rfft(fft_gyro))
             # Only look at 1-100 Hz (ignore DC and above Nyquist/2)
             freq_mask = (freqs >= 1) & (freqs <= 100)
             if np.any(freq_mask):
@@ -4845,11 +4852,18 @@ def analyze_gps_quality(data, sr):
         valid = ~(np.isnan(pos_n) | np.isnan(pos_e))
         if np.sum(valid) > 100:
             has_data = True
-            pn = pos_n[valid]
-            pe = pos_e[valid]
-            # Detect jumps: >500cm (5m) in a single sample
-            dn = np.abs(np.diff(pn))
-            de = np.abs(np.diff(pe))
+            # Per contiguous run: np.diff over pos_n[valid] joins the two sides of
+            # every NaN gap and reports the join as a jump.
+            dn_parts, de_parts = [], []
+            for a, b in contiguous_runs(valid, sr, 0.0):
+                if b - a < 2:
+                    continue
+                dn_parts.append(np.abs(np.diff(pos_n[a:b])))
+                de_parts.append(np.abs(np.diff(pos_e[a:b])))
+            if not dn_parts:
+                dn_parts, de_parts = [np.zeros(1)], [np.zeros(1)]
+            dn = np.concatenate(dn_parts)
+            de = np.concatenate(de_parts)
             dist_jump = np.sqrt(dn**2 + de**2)
             # Scale threshold by sample rate (at 500Hz, 5m/sample = 2500m/s which is impossible)
             max_speed_cms = 3000  # 30 m/s max realistic speed
@@ -5173,6 +5187,9 @@ POSHOLD_SETTLE_S = 2.0
 POSHOLD_TARGET_STEP_CM = 500.0
 
 # A toilet bowl has to actually go round. Thresholds for calling one:
+# A bowl must be observed on one unbroken stretch, not across stitched segments.
+TB_MIN_RUN_S = 15.0
+
 TB_MIN_RADIUS_CM = 100.0
 TB_MIN_REVOLUTIONS = 1.5
 TB_MIN_CONSISTENCY = 0.65
@@ -5418,9 +5435,12 @@ def analyze_position_hold(data, sr, phase_start=None, phase_end=None):
     # log navPos stepped 42 m in a single 1 ms sample -- 21891 m/s implied -- and
     # spent 0.032 s above 40 m, while CEP was 32 cm and p95 95 cm.
     if max_drift > max(10 * max(p99, 1.0), 500.0):
-        jump_n = np.abs(np.diff(pn[valid]))
-        jump_e = np.abs(np.diff(pe[valid]))
-        worst_step = float(np.max(np.hypot(jump_n, jump_e))) if len(jump_n) else 0.0
+        _parts = []
+        for _a, _b in contiguous_runs(valid, sr, 0.0):
+            if _b - _a >= 2:
+                _parts.append(np.hypot(np.abs(np.diff(pn[_a:_b])),
+                                       np.abs(np.diff(pe[_a:_b]))))
+        worst_step = float(np.max(np.concatenate(_parts))) if _parts else 0.0
         results["position_discontinuity_cm"] = round(worst_step, 1)
         findings.append(("INFO",
             f"Max drift {max_drift/100:.0f}m is an isolated position-estimate "
@@ -5792,7 +5812,20 @@ def analyze_nav_performance(data, sr, config=None, profile=None):
             # steadily rotating error vector, so count the turns.
             toilet_bowl = False
             tb_period = None
-            orbit = orbit_test(err_n, err_e, sr)
+            # err_n/err_e come from a boolean mask, so separate hold segments are
+            # concatenated. Unwrapping an angle across that join invents rotation:
+            # one log's two segments (14 s and 15 s) produced a "toilet bowl" of
+            # 18.5 s period, longer than either segment. Count turns on the longest
+            # unbroken stretch instead -- the same rule as analyze_position_hold.
+            runs = contiguous_runs(poshold_mask, sr, TB_MIN_RUN_S)
+            if runs:
+                a, b = max(runs, key=lambda r: r[1] - r[0])
+                seg_n = pos_n[a:b] - tgt_n[a:b]
+                seg_e = pos_e[a:b] - tgt_e[a:b]
+                keep = ~(np.isnan(seg_n) | np.isnan(seg_e))
+                orbit = orbit_test(seg_n[keep], seg_e[keep], sr) if keep.sum() > sr else None
+            else:
+                orbit = None
             if (orbit and orbit["radius_cm"] > TB_MIN_RADIUS_CM
                     and abs(orbit["net_rev"]) >= TB_MIN_REVOLUTIONS
                     and orbit["consistency"] >= TB_MIN_CONSISTENCY):
