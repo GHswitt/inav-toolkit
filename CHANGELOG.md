@@ -5,6 +5,25 @@ All notable changes to this fork, relative to the verbatim upstream import.
 Format: each entry corresponds to one commit. See `git log` for full reasoning and the
 measurements behind each change.
 
+## [2.23.23] — 2026-09-29
+
+### Fixed
+
+- **Hover peak-to-peak was set by the single worst sample.** One hover reported **234 deg/s
+  peak-to-peak against 3.65 deg/s RMS** — a ratio of 64:1 where a sinusoid gives 2.83 — because
+  **11 samples out of 179,000 (11 ms)** exceeded 50 deg/s. The finding then paired a "mild"
+  severity with "peak-to-peak 212°/s", which reads as alarming and lent weight to a D-term cut.
+  `gyro_p2p` is now the p0.1–p99.9 spread with the true extreme kept as `gyro_p2p_max`: roll on
+  that flight reads **21 deg/s** instead of 212.
+
+  Severity itself was always classified on RMS, so no verdict changes — only the number a reader
+  judges it by.
+
+  Combined with the hover-FFT fix in 2.23.22, the dominant frequency on that flight becomes
+  `None` on all three axes: the 38 Hz that justified *"D-term noise amplification causing
+  oscillation during hover"* came from the concatenation joins, not the aircraft. **That
+  recommendation is gone.**
+
 ## [2.23.22] — 2026-09-29
 
 ### Fixed

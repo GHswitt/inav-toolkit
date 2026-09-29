@@ -104,7 +104,7 @@ def _disable_colors():
 AXIS_NAMES = ["Roll", "Pitch", "Yaw"]
 AXIS_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D"]
 MOTOR_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D", "#A78BFA"]
-REPORT_VERSION = "2.23.22"
+REPORT_VERSION = "2.23.23"
 
 # ─── Frame and Prop Profiles ─────────────────────────────────────────────────
 # Two separate concerns:
@@ -3389,7 +3389,15 @@ def detect_hover_oscillation(data, sr, profile=None):
 
         # Amplitude metrics
         gyro_rms = float(np.sqrt(np.mean(hover_gyro ** 2)))
-        gyro_p2p = float(np.max(hover_gyro) - np.min(hover_gyro))
+        # Peak-to-peak from the extremes is set by whatever single worst sample the
+        # flight contains. On one hover it read 234 deg/s against 3.65 deg/s RMS --
+        # a ratio of 64:1 where a sinusoid gives 2.83 -- because 11 samples out of
+        # 179,000 (11 ms) exceeded 50 deg/s. The finding text then paired a "mild"
+        # severity with "peak-to-peak 212 deg/s", which reads as alarming and lends
+        # weight to a D-term cut nobody needs. Report the robust spread and keep the
+        # true extreme beside it.
+        gyro_p2p = float(np.percentile(hover_gyro, 99.9) - np.percentile(hover_gyro, 0.1))
+        gyro_p2p_max = float(np.max(hover_gyro) - np.min(hover_gyro))
 
         # Dominant frequency via FFT -- on ONE segment, never the concatenation.
         # hover_gyro stitches separate hover periods together, and each join is a
@@ -3473,6 +3481,7 @@ def detect_hover_oscillation(data, sr, profile=None):
             "axis": axis,
             "gyro_rms": gyro_rms,
             "gyro_p2p": gyro_p2p,
+            "gyro_p2p_max": gyro_p2p_max,
             "dominant_freq_hz": dominant_freq,
             "severity": severity,
             "cause": cause,

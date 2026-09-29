@@ -2620,3 +2620,22 @@ class TestNoTransformsAcrossGaps:
         d = {"n_rows": n, "time_s": t, "nav_pos_n": pn, "nav_pos_e": pe}
         r = analyze_gps_quality(d, self.SR)
         assert r.get("position_jumps", 0) == 0, r
+
+    def test_hover_p2p_is_robust_to_a_single_spike(self):
+        """11 samples in 179,000 set a 234 deg/s peak-to-peak against 3.65 RMS."""
+        from inav_toolkit.blackbox_analyzer import detect_hover_oscillation, get_frame_profile
+        n = 60000
+        t = np.arange(n) / self.SR
+        rng = np.random.default_rng(6)
+        gy = 3.0 * np.sin(2*np.pi*20*t) + rng.normal(0, 0.5, n)
+        gy[30000] = 194.0                       # one spike
+        gy[30001] = -40.0
+        sp = np.zeros(n)
+        d = {"n_rows": n, "time_s": t,
+             "setpoint_roll": sp, "gyro_roll": gy,
+             "setpoint_pitch": sp, "gyro_pitch": np.zeros(n),
+             "setpoint_yaw": sp, "gyro_yaw": np.zeros(n)}
+        res = detect_hover_oscillation(d, self.SR, get_frame_profile(7))
+        roll = [r for r in (res or []) if r.get("axis") == "Roll"][0]
+        assert roll["gyro_p2p"] < 20, roll["gyro_p2p"]        # ~8.5 for a 3 deg/s sine
+        assert roll["gyro_p2p_max"] > 200, roll["gyro_p2p_max"]  # extreme still kept
