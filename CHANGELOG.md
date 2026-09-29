@@ -5,6 +5,28 @@ All notable changes to this fork, relative to the verbatim upstream import.
 Format: each entry corresponds to one commit. See `git log` for full reasoning and the
 measurements behind each change.
 
+## [2.23.20] — 2026-09-29
+
+### Fixed
+
+- **A log whose header lost its final newline decoded to zero frames.** Real damage: 199 bytes
+  vanished mid-line at `H waypoints:0,0`, taking the terminating newline and the following nine
+  header lines with them, so binary frame data began immediately after `H waypoints:0`.
+  `_find_binary_start()` searched each line for a newline, found none for megabytes, gave up
+  (`nl == -1`) and returned the **start of that line** — so the decoder read header text as
+  frames and reported nothing for an intact **232 s** flight.
+
+  The line scan now stops at the first control byte, since header text is printable ASCII, and
+  locates the binary start at the frame marker just before it. `'H'` is excluded there: it is a
+  valid frame type (GPS Home) *and* the first character of every header line, so matching it
+  returned the line start. The damaged log now decodes to 232,166 frames with no repair needed.
+
+- **`decode_blackbox_native()` called `sys.exit(1)` from library code**, and under `quiet=True`
+  did so with no message — a damaged log produced a bare `SystemExit` with nothing to act on. It
+  now raises `BlackboxDecodeError` carrying the decoder stats and header-key count, with a hint
+  pointing at header damage when the header looks short. The CLI keeps its exit-1-with-a-message
+  behaviour by catching it at the entry point.
+
 ## [2.23.19] — 2026-09-28
 
 ### Fixed

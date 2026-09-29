@@ -104,7 +104,7 @@ def _disable_colors():
 AXIS_NAMES = ["Roll", "Pitch", "Yaw"]
 AXIS_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D"]
 MOTOR_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D", "#A78BFA"]
-REPORT_VERSION = "2.23.19"
+REPORT_VERSION = "2.23.20"
 
 # ─── Frame and Prop Profiles ─────────────────────────────────────────────────
 # Two separate concerns:
@@ -1401,11 +1401,34 @@ class BlackboxDecoder:
         pos = 0
         last_header_end = 0
         while pos < min(self.end, 65536):  # headers are always in first 64KB
-            nl = -1
+            # Scan for the newline that ends this line, but stop at the first
+            # control byte: header text is printable ASCII, so a control byte means
+            # the header's final newline was lost and binary frame data begins
+            # here. One real log dropped 199 bytes mid-line at "H waypoints:0,0",
+            # after which no newline appears for megabytes -- the old scan gave up
+            # (nl == -1) and returned the START of that line, so the decoder read
+            # header text as frames and reported zero frames for an intact 232 s
+            # flight.
+            nl, ctrl = -1, -1
             for i in range(pos, min(pos + 2000, self.end)):
-                if self.buf[i] == ord('\n'):
+                b = self.buf[i]
+                if b == 0x0a:
                     nl = i
                     break
+                if b < 0x20 and b not in (0x09, 0x0d):
+                    ctrl = i
+                    break
+            if ctrl != -1:
+                # Binary starts at the frame marker just before the control byte.
+                # 'H' is excluded: it is a valid frame type but also begins every
+                # header line, and matching it here returns the line start.
+                # stop bound is pos-1 so that pos itself is examined: when the
+                # previous line ended normally, the marker sits exactly at pos and
+                # an exclusive bound of pos skipped it.
+                for j in range(ctrl - 1, max(pos - 1, ctrl - 17), -1):
+                    if self.buf[j] in self.VALID_FRAMES and self.buf[j] != self.FRAME_H:
+                        return j
+                return ctrl
             if nl == -1:
                 break
             if nl - pos >= 2 and self.buf[pos] == ord('H') and self.buf[pos + 1] == ord(' '):
@@ -1815,6 +1838,24 @@ class BlackboxDecoder:
         return data
 
 
+# A healthy INAV 9.x header carries ~80 keys; far fewer means damage.
+EXPECTED_HEADER_KEYS_MIN = 60
+
+
+class BlackboxDecodeError(RuntimeError):
+    """The log could not be decoded. Carries the decoder stats for diagnosis.
+
+    Raised instead of calling sys.exit(): a library function must not kill the
+    caller's process, and under quiet=True the old code exited with status 1 and
+    no message at all -- a damaged header produced a silent SystemExit with
+    nothing to act on."""
+
+    def __init__(self, message, stats=None, header_lines=None):
+        super().__init__(message)
+        self.stats = stats or {}
+        self.header_lines = header_lines
+
+
 def decode_blackbox_native(filepath, raw_params, quiet=False):
     """Decode a blackbox binary log file using the native decoder.
     Returns a data dict in the same format as parse_csv_log."""
@@ -1824,10 +1865,18 @@ def decode_blackbox_native(filepath, raw_params, quiet=False):
 
     total = decoder.stats['i_frames'] + decoder.stats['p_frames']
     if total == 0:
+        n_hdr = len(raw_params or {})
+        hint = ""
+        if n_hdr and n_hdr < EXPECTED_HEADER_KEYS_MIN:
+            hint = (f" The header holds only {n_hdr} keys, which suggests it is damaged "
+                    f"(see TODO_quad.md section 8): bytes can be lost mid-header, and the "
+                    f"final newline with them. Graft the missing span from a log of the same "
+                    f"firmware and board.")
+        msg = f"No frames decoded from {filepath}.{hint}"
         if not quiet:
-            print("  ERROR: No frames decoded from blackbox log.")
+            print(f"  ERROR: {msg}")
             print(f"    Stats: {decoder.stats}")
-        sys.exit(1)
+        raise BlackboxDecodeError(msg, decoder.stats, n_hdr)
 
     if not quiet:
         print(f"  Decoded: {total:,} frames "
@@ -1838,9 +1887,10 @@ def decode_blackbox_native(filepath, raw_params, quiet=False):
 
     data = decoder.frames_to_data_dict(frames, field_names)
     if data is None:
+        msg = f"Decoded {total} frames from {filepath} but could not build the analysis arrays."
         if not quiet:
-            print("  ERROR: Failed to convert decoded frames to analysis data.")
-        sys.exit(1)
+            print(f"  ERROR: {msg}")
+        raise BlackboxDecodeError(msg, decoder.stats)
 
     # Attach decoded auxiliary frame data for nav analysis
     data["_slow_frames"] = decoder.slow_frames    # [(frame_idx, {field: value})]
@@ -14143,4 +14193,12 @@ def _analyze_single_log(logfile, args, config_raw=None, summary_only=False):
         print()
 
 if __name__ == "__main__":
-    main()
+    # The decoder raises instead of calling sys.exit(), so the CLI keeps its
+    # exit-1-with-a-message behaviour here rather than in the library.
+    try:
+        main()
+    except BlackboxDecodeError as exc:
+        print(f"\nERROR: {exc}")
+        if exc.stats:
+            print(f"  Decoder stats: {exc.stats}")
+        sys.exit(1)

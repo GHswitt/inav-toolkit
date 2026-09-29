@@ -2470,3 +2470,62 @@ class TestNoiseScoreCalibration:
         assert not has_rpm(plan_for(NOISE_AMPLITUDE_OK_DPS + 10.0, "propwash"))
         # loud and rotational -> recommend it
         assert has_rpm(plan_for(NOISE_AMPLITUDE_OK_DPS + 10.0, "prop_harmonics"))
+
+
+class TestDamagedHeaderRecovery:
+    """A header can lose bytes mid-line, taking its final newline with it."""
+
+    def _log_bytes(self, drop_tail=False):
+        hdr = (b"H Product:Blackbox flight data recorder by Nicholas Sherlock\n"
+               b"H Data version:2\n"
+               b"H Firmware revision:INAV 9.1.0 (15317503) SPEEDYBEEF7V3\n"
+               b"H Field I name:loopIteration,time\n"
+               b"H Field I signed:0,0\n"
+               b"H Field I predictor:0,0\n"
+               b"H Field I encoding:1,1\n"
+               b"H Field P predictor:6,2\n"
+               b"H Field P encoding:9,0\n"
+               b"H looptime:500\n"
+               b"H waypoints:0,0\n")
+        if drop_tail:
+            # the real failure: bytes vanish mid-line, newline included
+            hdr = hdr[:hdr.rfind(b"H waypoints:0,0\n")] + b"H waypoints:0"
+        return hdr + b"S\x01\x03\x00\x01"
+
+    def test_data_start_found_when_final_newline_is_lost(self):
+        from inav_toolkit.blackbox_analyzer import BlackboxDecoder
+        import tempfile, os
+        for drop in (False, True):
+            with tempfile.TemporaryDirectory() as td:
+                fp = os.path.join(td, "t.TXT")
+                blob = self._log_bytes(drop_tail=drop)
+                open(fp, "wb").write(blob)
+                dec = BlackboxDecoder({})
+                dec.buf = blob
+                dec.end = len(blob)
+                start = dec._find_binary_start()
+                assert blob[start] in dec.VALID_FRAMES, (drop, start, blob[start:start+4])
+
+    def test_decode_failure_raises_instead_of_exiting(self):
+        """sys.exit() in a library killed the caller with no message under quiet."""
+        from inav_toolkit.blackbox_analyzer import (decode_blackbox_native,
+                                                    BlackboxDecodeError)
+        import tempfile, os, pytest
+        with tempfile.TemporaryDirectory() as td:
+            fp = os.path.join(td, "empty.TXT")
+            open(fp, "wb").write(b"H Product:Blackbox\nH Data version:2\n")
+            with pytest.raises(BlackboxDecodeError) as ei:
+                decode_blackbox_native(fp, {"Product": "Blackbox"}, quiet=True)
+            assert "No frames decoded" in str(ei.value)
+            assert ei.value.stats is not None
+
+    def test_damaged_header_error_names_the_cause(self):
+        from inav_toolkit.blackbox_analyzer import (decode_blackbox_native,
+                                                    BlackboxDecodeError)
+        import tempfile, os, pytest
+        with tempfile.TemporaryDirectory() as td:
+            fp = os.path.join(td, "short.TXT")
+            open(fp, "wb").write(b"H Product:Blackbox\n")
+            with pytest.raises(BlackboxDecodeError) as ei:
+                decode_blackbox_native(fp, {"Product": "Blackbox"}, quiet=True)
+            assert "damaged" in str(ei.value).lower()
