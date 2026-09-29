@@ -2529,3 +2529,49 @@ class TestDamagedHeaderRecovery:
             with pytest.raises(BlackboxDecodeError) as ei:
                 decode_blackbox_native(fp, {"Product": "Blackbox"}, quiet=True)
             assert "damaged" in str(ei.value).lower()
+
+
+class TestNavPerfDetectors:
+    """analyze_nav_performance had its own copies of both detectors."""
+
+    SR = 1000.0
+
+    def _log(self, n=120000, commanded_climb=False, orbit=False):
+        t = np.arange(n) / self.SR
+        rng = np.random.default_rng(9)
+        tgt_z = np.full(n, 1800.0)
+        pos_z = 1800.0 + rng.normal(0, 15, n)
+        if commanded_climb:
+            # pilot commands +24 m partway through, target follows
+            ramp = np.clip((t - 40) * 150.0, 0, 2400.0)
+            tgt_z = tgt_z + ramp
+            pos_z = pos_z + ramp          # craft follows: not a hold error
+        pn = 1000.0 + rng.normal(0, 20, n)
+        pe = 2000.0 + rng.normal(0, 20, n)
+        if orbit:
+            pn = 1000.0 + 300.0 * np.cos(2*np.pi*0.1*t)
+            pe = 2000.0 + 300.0 * np.sin(2*np.pi*0.1*t)
+        from inav_toolkit.blackbox_analyzer import FM_NAV_ALTHOLD, FM_NAV_POSHOLD
+        modes = np.full(n, (1 << FM_NAV_ALTHOLD) | (1 << FM_NAV_POSHOLD), dtype=np.int64)
+        return {"n_rows": n, "time_s": t, "active_modes": modes,
+                "nav_pos_u": pos_z, "nav_tgt_u": tgt_z,
+                "nav_pos_n": pn, "nav_pos_e": pe,
+                "nav_tgt_n": np.full(n, 1000.0), "nav_tgt_e": np.full(n, 2000.0),
+                # analyze_nav_performance requires velocity to run at all
+                "nav_vel_n": np.gradient(pn, t), "nav_vel_e": np.gradient(pe, t),
+                "nav_state": np.full(n, 7)}
+
+    def test_real_altitude_error_still_reported(self):
+        from inav_toolkit.blackbox_analyzer import analyze_nav_performance
+        d = self._log()
+        d["nav_pos_u"] = d["nav_pos_u"] + 400.0    # craft sits 4 m below target
+        r = analyze_nav_performance(d, self.SR)
+        ah = (r or {}).get("althold") or {}
+        assert ah["rms_error_cm"] > 300, ah
+
+    def test_nav_perf_toilet_bowl_uses_revolution_counting(self):
+        from inav_toolkit.blackbox_analyzer import analyze_nav_performance
+        quiet = analyze_nav_performance(self._log(), self.SR)
+        bowl = analyze_nav_performance(self._log(orbit=True), self.SR)
+        assert not ((quiet or {}).get("poshold") or {}).get("toilet_bowl"), "false positive"
+        assert ((bowl or {}).get("poshold") or {}).get("toilet_bowl"), "missed a real orbit"

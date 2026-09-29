@@ -104,7 +104,7 @@ def _disable_colors():
 AXIS_NAMES = ["Roll", "Pitch", "Yaw"]
 AXIS_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D"]
 MOTOR_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D", "#A78BFA"]
-REPORT_VERSION = "2.23.20"
+REPORT_VERSION = "2.23.21"
 
 # ─── Frame and Prop Profiles ─────────────────────────────────────────────────
 # Two separate concerns:
@@ -5232,6 +5232,14 @@ def orbit_test(err_n, err_e, sr, smooth_s=0.5):
 # alone does not. Flag it when the spread is this large.
 POSHOLD_SPREAD_RATIO = 2.0
 
+# INAV's own alt_hold_deadband default: outside this the stick is commanding a
+# climb or descent and altitude hold is suspended.
+ALTHOLD_DEADBAND_DEFAULT = 50.0
+# An oscillation needs an unbroken stretch and enough cycles to be one.
+ALTHOLD_MIN_OSC_RUN_S = 10.0
+ALTHOLD_MIN_OSC_CYCLES = 8.0
+
+
 
 def analyze_position_hold_segments(data, sr, held):
     """Position hold across every held segment, not only the longest.
@@ -5775,30 +5783,21 @@ def analyze_nav_performance(data, sr, config=None, profile=None):
             rms_error = float(np.sqrt(np.mean(err_dist**2)))
             hold_duration = np.sum(valid) / sr
 
-            # Toilet bowl detection (circular oscillation from compass issues)
+            # Toilet bowl detection. This was a second, independent implementation
+            # that matched dominant FFT peaks between the two axes -- the approach
+            # replaced in analyze_position_hold() because it fires on drift. Left
+            # unfixed it contradicted the corrected test on the same flight,
+            # declaring a "toilet bowl" of 16 cm radius and telling the pilot to
+            # check a compass that was fine. Both now use orbit_test(): a bowl is a
+            # steadily rotating error vector, so count the turns.
             toilet_bowl = False
             tb_period = None
-            if len(err_n) > sr * 3:
-                from scipy.fft import rfft, rfftfreq
-                freqs_n = rfftfreq(len(err_n), 1.0 / sr)
-                spec_n = np.abs(rfft(err_n - np.mean(err_n)))
-                spec_e = np.abs(rfft(err_e - np.mean(err_e)))
-
-                # Look for matching peaks in both axes (0.1-2Hz range)
-                band = (freqs_n >= 0.1) & (freqs_n <= 2.0)
-                if np.any(band):
-                    peak_n = freqs_n[band][np.argmax(spec_n[band])]
-                    peak_e = freqs_n[band][np.argmax(spec_e[band])]
-                    # Peaks within 20% of each other = likely toilet bowl
-                    if abs(peak_n - peak_e) < max(peak_n, peak_e) * 0.2:
-                        # Check if both axes have significant oscillation
-                        n_power = spec_n[band][np.argmax(spec_n[band])]
-                        e_power = spec_e[band][np.argmax(spec_e[band])]
-                        n_mean = np.mean(spec_n[band])
-                        e_mean = np.mean(spec_e[band])
-                        if n_power > n_mean * 4 and e_power > e_mean * 4:
-                            toilet_bowl = True
-                            tb_period = 1.0 / ((peak_n + peak_e) / 2)
+            orbit = orbit_test(err_n, err_e, sr)
+            if (orbit and orbit["radius_cm"] > TB_MIN_RADIUS_CM
+                    and abs(orbit["net_rev"]) >= TB_MIN_REVOLUTIONS
+                    and orbit["consistency"] >= TB_MIN_CONSISTENCY):
+                toilet_bowl = True
+                tb_period = orbit["period_s"]
 
             results["poshold"] = {
                 "cep_cm": round(cep, 1),
@@ -5862,31 +5861,81 @@ def analyze_nav_performance(data, sr, config=None, profile=None):
         ah_tgt_z = tgt_z[althold_mask]
 
         valid = ~(np.isnan(ah_pos_z) | np.isnan(ah_tgt_z))
+
+        # Altitude hold is SUSPENDED while the throttle stick is off centre: the
+        # craft climbs or descends on command, navTgtPos[2] stays put, and the
+        # target only re-latches when the stick returns. So the target is a step
+        # function, not a ramp, and "error" grows for as long as the pilot is
+        # flying. Measuring across that reported 1.37 m RMS on a flight the pilot
+        # experienced as holding; counting only the samples inside the craft's own
+        # alt_hold_deadband gives 0.47 m.
+        #
+        # A first attempt filtered on target *rate* and excluded nothing, because
+        # the target does not ramp; skipping a settling window after each step made
+        # it worse still (1.58 m), because the error precedes the step rather than
+        # following it. The stick is the discriminator.
+        # rcData[3] is the pilot's stick; rcCommand[3] in AltHold is the altitude
+        # controller's OUTPUT, which barely moves (std 23 against 56) and filters
+        # nothing. Use the stick, fall back to rcCommand only if absent.
+        thr = data.get("rc_throttle")
+        if thr is None:
+            thr = data.get("throttle")
+        if thr is not None and len(thr) == len(althold_mask):
+            deadband = ALTHOLD_DEADBAND_DEFAULT
+            if config:
+                try:
+                    deadband = float(config.get("alt_hold_deadband", deadband) or deadband)
+                except (TypeError, ValueError):
+                    pass
+            ah_thr = np.asarray(thr, dtype=float)[althold_mask]
+            # STICK mode zeroes on the throttle at engagement, so the reference is
+            # per-segment rather than a fixed mid-stick value.
+            ref = float(np.nanmedian(ah_thr)) if len(ah_thr) else 0.0
+            held = np.abs(ah_thr - ref) <= deadband
+            if np.count_nonzero(valid & held) > sr * 2:
+                valid = valid & held
+                results["althold_stick_filtered"] = True
+
         if np.sum(valid) > sr * 2:
             err_z = ah_pos_z[valid] - ah_tgt_z[valid]
             rms_z = float(np.sqrt(np.mean(err_z**2)))
             max_z = float(np.max(np.abs(err_z)))
+            p95_z = float(np.percentile(np.abs(err_z), 95))
+            p99_z = float(np.percentile(np.abs(err_z), 99))
             hold_dur = np.sum(valid) / sr
 
-            # Oscillation detection in Z
+            # Oscillation detection in Z, on one unbroken stretch. Held time comes
+            # in separate runs (40 s, 35 s, 9 s on one flight) and an FFT across a
+            # boolean-masked concatenation treats every join as signal -- the same
+            # defect corrected for heading in 2.23.6. A peak also has to survive
+            # enough cycles to mean anything: 0.14 Hz over 40 s is 5.6 of them.
             z_osc = False
             z_osc_freq = None
-            if len(err_z) > sr * 2:
+            runs = contiguous_runs(valid, sr, ALTHOLD_MIN_OSC_RUN_S)
+            if runs:
+                a, b = max(runs, key=lambda r: r[1] - r[0])
+                seg = ah_pos_z[a:b] - ah_tgt_z[a:b]
+                seg = np.nan_to_num(seg - np.nanmean(seg))
+                span_s = (b - a) / sr
                 from scipy.fft import rfft, rfftfreq
-                freqs = rfftfreq(len(err_z), 1.0 / sr)
-                spec = np.abs(rfft(err_z - np.mean(err_z)))
+                freqs = rfftfreq(len(seg), 1.0 / sr)
+                spec = np.abs(rfft(seg))
                 band = (freqs >= 0.1) & (freqs <= 5.0)
                 if np.any(band):
                     peak_idx = np.argmax(spec[band])
+                    peak_f = float(freqs[band][peak_idx])
                     peak_power = spec[band][peak_idx]
                     mean_power = np.mean(spec[band])
-                    if peak_power > mean_power * 5:
+                    if (peak_power > mean_power * 5
+                            and peak_f * span_s >= ALTHOLD_MIN_OSC_CYCLES):
                         z_osc = True
-                        z_osc_freq = float(freqs[band][peak_idx])
+                        z_osc_freq = peak_f
 
             results["althold"] = {
                 "rms_error_cm": round(rms_z, 1),
                 "max_error_cm": round(max_z, 1),
+                "p95_error_cm": round(p95_z, 1),
+                "p99_error_cm": round(p99_z, 1),
                 "hold_duration_s": round(hold_dur, 1),
                 "oscillation": z_osc,
                 "osc_freq_hz": round(z_osc_freq, 2) if z_osc_freq else None,

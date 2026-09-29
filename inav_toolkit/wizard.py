@@ -21,7 +21,7 @@ import time
 try:
     from inav_toolkit import __version__ as VERSION
 except ImportError:
-    VERSION = "2.23.20"
+    VERSION = "2.23.21"
 
 # Module paths for subprocess invocation (package-aware)
 ANALYZER_MODULE = "inav_toolkit.blackbox_analyzer"

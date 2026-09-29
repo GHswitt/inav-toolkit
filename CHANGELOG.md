@@ -5,6 +5,40 @@ All notable changes to this fork, relative to the verbatim upstream import.
 Format: each entry corresponds to one commit. See `git log` for full reasoning and the
 measurements behind each change.
 
+## [2.23.21] — 2026-09-29
+
+### Fixed
+
+- **`analyze_nav_performance` carried its own copy of the toilet-bowl detector**, matching
+  dominant FFT peaks between the N and E axes — the approach replaced in
+  `analyze_position_hold()` by 2.23.7 because it fires on drift. Left unfixed it contradicted the
+  corrected test on the same flight, declaring a **16 cm-radius "toilet bowl"** and telling the
+  pilot to check a compass that was fine, while `orbit_test()` measured **−0.297 revolutions** in
+  101 s. Both now count turns.
+
+- **Altitude-hold error counted the pilot flying.** Altitude hold is *suspended* while the
+  throttle stick is off centre: the craft climbs on command, `navTgtPos[2]` stays put, and the
+  target re-latches when the stick returns. So the target is a step function and "error" grows
+  for as long as the pilot is flying. On one flight this reported **137 cm RMS** over 186 s for a
+  hold the pilot experienced as steady. Filtering to samples inside the craft's own
+  `alt_hold_deadband` gives **47 cm RMS over 90 s** — which matches what was felt.
+
+  Two earlier attempts are recorded in the code because both were wrong: filtering on target
+  *rate* excluded nothing (the target does not ramp), and skipping a settling window after each
+  step made it worse (1.37 → 1.58 m) because the error *precedes* the step. The discriminator is
+  the stick — and specifically `rcData[3]`, not `rcCommand[3]`, which in AltHold is the altitude
+  controller's output and barely moves (std 23 against 56).
+
+- **`max_error_cm` was set by a 29 ms transient** — 7.11 m, 0.032 % of held time, at the instant
+  the target re-latches. `p95_error_cm` and `p99_error_cm` are now reported alongside: 1.06 m and
+  1.56 m against that 7.11 m maximum.
+
+- **The altitude oscillation test ran across gaps.** Held time arrives in separate runs (40 s,
+  35 s, 9 s on that flight) and the FFT was taken over a boolean-masked concatenation, treating
+  every join as signal — the defect corrected for heading in 2.23.6. It now runs on the longest
+  unbroken run and requires the peak to survive `ALTHOLD_MIN_OSC_CYCLES` (8). The 0.14 Hz warning
+  on 47 cm RMS does not survive either condition.
+
 ## [2.23.20] — 2026-09-29
 
 ### Fixed
