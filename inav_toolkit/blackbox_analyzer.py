@@ -14286,7 +14286,16 @@ def _analyze_single_log(logfile, args, config_raw=None, summary_only=False):
                                      propwash_results=propwash_results,
                                      failsafe_results=failsafe_results)
         on = args.output or os.path.splitext(os.path.basename(logfile))[0] + "_report.html"
-        op = os.path.join(os.path.dirname(logfile) or ".", on)
+        # An explicit --output path is honoured as given; only a bare filename (or
+        # the default) is placed next to the log. Previously any directory in
+        # --output was joined onto the log's own directory, so `-o Logs/x.html`
+        # for a log already in Logs/ silently became Logs/Logs/x.html and the
+        # write failed after the whole analysis had run.
+        if os.path.dirname(on):
+            op = on
+            os.makedirs(os.path.dirname(op), exist_ok=True)
+        else:
+            op = os.path.join(os.path.dirname(logfile) or ".", on)
         with open(op, "w", encoding="utf-8") as f: f.write(html)
         print(f"\n  ✓ {t('report.html_saved', path=op)}")
 

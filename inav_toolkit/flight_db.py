@@ -501,9 +501,15 @@ class FlightDB:
         if not prev:
             return {"has_previous": False}
 
+        # sqlite3.Row supports indexing but not .get(); the score-component
+        # comparison below needs .get() for columns that may be NULL, so take
+        # plain dicts here rather than sprinkling try/except at each use.
+        prev = dict(prev)
+
         curr = conn.execute(
             "SELECT * FROM flights WHERE id = ?",
             (current_flight_id,)).fetchone()
+        curr = dict(curr) if curr is not None else {}
 
         # Get axis data for both
         def get_axes(fid):
