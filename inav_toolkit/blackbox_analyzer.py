@@ -5302,6 +5302,9 @@ POSITION_HELD_NAV_IDS = frozenset({
 # After a new hold point is taken, the craft is travelling to it rather than
 # holding it. Skip this long, and treat a target jump this large as a new point.
 POSHOLD_SETTLE_S = 2.0
+# INAV's pos_hold_deadband default, in r/c points. Outside it the sticks are
+# repositioning the hold point, not holding it.
+POSHOLD_STICK_DEADBAND = 10.0
 POSHOLD_TARGET_STEP_CM = 500.0
 
 # A toilet bowl has to actually go round. Thresholds for calling one:
@@ -5376,7 +5379,7 @@ ALTHOLD_MIN_OSC_CYCLES = 8.0
 
 
 
-def analyze_position_hold_segments(data, sr, held):
+def analyze_position_hold_segments(data, sr, held, config=None):
     """Position hold across every held segment, not only the longest.
 
     Reporting the longest segment alone hid a real spread on one log: its four
@@ -5391,7 +5394,7 @@ def analyze_position_hold_segments(data, sr, held):
     """
     per = []
     for a, b, st in held:
-        r = analyze_position_hold(data, sr, a, b)
+        r = analyze_position_hold(data, sr, a, b, config=config)
         if r.get("cep_cm") is None:
             continue
         r["start_s"] = round(float(a) / sr, 1)
@@ -5403,7 +5406,7 @@ def analyze_position_hold_segments(data, sr, held):
         # Nothing measurable: return the longest segment's result so its
         # explanation (stale target, too little settled hold) still reaches the user.
         longest = max(held, key=lambda p: p[1] - p[0])
-        out = analyze_position_hold(data, sr, longest[0], longest[1])
+        out = analyze_position_hold(data, sr, longest[0], longest[1], config=config)
         out["segments"] = len(held)
         return out
 
@@ -5442,7 +5445,7 @@ def analyze_position_hold_segments(data, sr, held):
     return out
 
 
-def analyze_position_hold(data, sr, phase_start=None, phase_end=None):
+def analyze_position_hold(data, sr, phase_start=None, phase_end=None, config=None):
     """Analyze position hold performance.
 
     Detects:
@@ -5521,6 +5524,40 @@ def analyze_position_hold(data, sr, phase_start=None, phase_end=None):
         moved = np.flatnonzero(step > POSHOLD_TARGET_STEP_CM)
         for i in moved:
             valid[i:i + settle] = False
+
+    # The settling window above only covers what follows a target step, and the
+    # contamination is what *precedes* it -- the same lesson the AltHold filter
+    # records. While the roll/pitch sticks are deflected the pilot is flying the
+    # craft to a new spot, navTgtPos stays frozen at the old one, and "error" is
+    # really distance travelled. The target re-latches when the sticks centre.
+    # On LOG00009 that read as max drift 602 cm against a CEP of 28 cm; filtering
+    # on the sticks gives a true worst case of 87 cm.
+    deadband = POSHOLD_STICK_DEADBAND
+    if config:
+        try:
+            deadband = float(config.get("pos_hold_deadband", deadband) or deadband)
+        except (TypeError, ValueError):
+            pass
+    # Slice to the same phase window as pn/pe/tn/te above, or the lengths will
+    # not match and the filter silently does nothing.
+    _rr, _rp = data.get("rc_roll"), data.get("rc_pitch")
+    if _rr is not None and _rp is not None:
+        _rr = np.asarray(_rr, dtype=float)[s:e]
+        _rp = np.asarray(_rp, dtype=float)[s:e]
+    if _rr is not None and _rp is not None and len(_rr) == len(valid):
+        # rcData centres on 1500; INAV deadbands rcCommand, which expo makes
+        # smaller near centre, so testing the raw stick excludes slightly more
+        # than the firmware would. Erring wide is right for a hold metric.
+        moving = (np.abs(_rr - 1500.0) > deadband) | (np.abs(_rp - 1500.0) > deadband)
+        moving = np.where(np.isfinite(moving), moving, False)
+        released = np.flatnonzero(np.diff(moving.astype(np.int8)) == -1)
+        _held = valid & ~moving
+        for i in released:
+            _held[i:i + settle] = False
+        # Only adopt it if enough hold survives to be worth reporting.
+        if np.sum(_held) >= sr * 3:
+            valid = _held
+            results["stick_filtered"] = True
 
     if np.sum(valid) < sr * 3:
         results["findings"] = [("INFO",
@@ -5911,6 +5948,33 @@ def analyze_nav_performance(data, sr, config=None, profile=None):
         valid = ~(np.isnan(ph_pos_n) | np.isnan(ph_pos_e) |
                   np.isnan(ph_tgt_n) | np.isnan(ph_tgt_e))
 
+        # While the roll/pitch sticks are deflected the pilot is repositioning:
+        # navTgtPos stays frozen at the old hold point and re-latches when the
+        # sticks centre, so "error" is distance travelled, not drift. On LOG00009
+        # that reported max drift 602 cm beside a CEP of 28 cm; filtering gives a
+        # true worst case of 87 cm. This is a second implementation of the metric
+        # in analyze_position_hold(), which already filters -- as with the toilet
+        # bowl detector below, leaving one of the pair unfixed just means the two
+        # contradict each other on the same flight.
+        _db = POSHOLD_STICK_DEADBAND
+        if config:
+            try:
+                _db = float(config.get("pos_hold_deadband", _db) or _db)
+            except (TypeError, ValueError):
+                pass
+        _rr, _rp = data.get("rc_roll"), data.get("rc_pitch")
+        if _rr is not None and _rp is not None and len(_rr) == len(poshold_mask):
+            _rr = np.asarray(_rr, dtype=float)[poshold_mask]
+            _rp = np.asarray(_rp, dtype=float)[poshold_mask]
+            _moving = ((np.abs(_rr - 1500.0) > _db) | (np.abs(_rp - 1500.0) > _db))
+            _moving = np.where(np.isfinite(_moving), _moving, False)
+            _settle = int(POSHOLD_SETTLE_S * sr)
+            _held = valid & ~_moving
+            for _i in np.flatnonzero(np.diff(_moving.astype(np.int8)) == -1):
+                _held[_i:_i + _settle] = False
+            if np.sum(_held) > sr * 2:
+                valid = _held
+
         if np.sum(valid) > sr * 2:  # at least 2 seconds of poshold
             err_n = ph_pos_n[valid] - ph_tgt_n[valid]
             err_e = ph_pos_e[valid] - ph_tgt_e[valid]
@@ -6290,7 +6354,7 @@ def run_nav_analysis(data, sr, config=None):
             # hid a real spread: one log's segments measured CEP 31.9, 98.2, 181.1
             # and 64.7 cm, and only the 31.9 cm one was ever shown -- which made a
             # position loop with 1 m excursions look like it held to a foot.
-            results["poshold"] = analyze_position_hold_segments(data, sr, held)
+            results["poshold"] = analyze_position_hold_segments(data, sr, held, config=config)
 
     # ─── Overall nav score ───
     scores = []
