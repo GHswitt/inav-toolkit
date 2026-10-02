@@ -5223,7 +5223,7 @@ def analyze_baro_quality(data, sr):
     return results
 
 
-def analyze_altitude_hold(data, sr, phase_start=None, phase_end=None):
+def analyze_altitude_hold(data, sr, phase_start=None, phase_end=None, config=None):
     """Analyze altitude hold performance in a specific flight phase.
 
     Requires navPos[2] (altitude) and navTgtPos[2] (target altitude).
@@ -5248,6 +5248,43 @@ def analyze_altitude_hold(data, sr, phase_start=None, phase_end=None):
     if np.sum(valid) < sr * 3:
         return results
 
+    # Altitude hold is suspended while the throttle stick is off centre: the craft
+    # climbs on command, navTgtPos[2] stays put, and "error" is the commanded
+    # climb. This is the third implementation of the altitude-hold error in this
+    # file and was the only one left unfiltered, which is why it reported 1464cm
+    # peak-to-peak on a flight the other two measured at 52cm RMS / 90cm p99.
+    # The reference is the stick at engagement, per segment; rcData[3] is the
+    # pilot's stick, rcCommand[3] in AltHold is the controller's output.
+    _thr = data.get("rc_throttle")
+    if _thr is None:
+        _thr = data.get("throttle")
+    if _thr is not None and len(_thr) == len(data["nav_pos_u"]):
+        _deadband = ALTHOLD_DEADBAND_DEFAULT
+        if config:
+            try:
+                _deadband = float(config.get("alt_hold_deadband", _deadband) or _deadband)
+            except (TypeError, ValueError):
+                pass
+        _t = np.asarray(_thr, dtype=float)[s:e]
+        _settle = max(1, int(round(0.5 * sr)))
+        # One reference for the whole window is not enough: the window can span
+        # several engagements and hover throttle drifts between them. The target
+        # itself marks each re-latch, so cut on target steps and take a reference
+        # per segment. (Taking a single median here reported 503cm p1-p99 on a
+        # window the per-segment version puts at 85cm.)
+        _bounds = [0] + list(np.flatnonzero(np.abs(np.diff(tgt_z)) > 100.0) + 1) + [len(_t)]
+        _held = np.zeros(len(_t), dtype=bool)
+        for _a, _b in zip(_bounds[:-1], _bounds[1:]):
+            if _b - _a < _settle:
+                continue
+            _ref = float(np.nanmedian(_t[_a:_a + _settle]))
+            if not np.isfinite(_ref):
+                continue
+            _held[_a:_b] = np.abs(_t[_a:_b] - _ref) <= _deadband
+        _held &= valid
+        if np.sum(_held) >= sr * 3:
+            valid = _held
+
     pz = pos_z[valid]
     tz = tgt_z[valid]
     error = pz - tz  # altitude error in cm
@@ -5256,17 +5293,28 @@ def analyze_altitude_hold(data, sr, phase_start=None, phase_end=None):
     score = 100
 
     # ─── Oscillation: peak-to-peak of error ───
-    osc = float(np.max(error) - np.min(error))
+    # max-min is defined by two samples and says nothing about how long the craft
+    # spent there. Judge on the 1-99 percentile span and quote the extreme beside
+    # it, so a single excursion cannot read as sustained oscillation.
+    osc = float(np.percentile(error, 99) - np.percentile(error, 1))
+    osc_max = float(np.max(error) - np.min(error))
     results["oscillation_cm"] = round(osc, 1)
+    results["oscillation_peak_cm"] = round(osc_max, 1)
 
     if osc > 200:
         score -= 40
-        findings.append(("WARNING", f"Large altitude oscillation: {osc:.0f}cm peak-to-peak "
+        findings.append(("WARNING", f"Large altitude oscillation: {osc:.0f}cm p1-p99 "
                          "(reduce nav_mc_vel_z_p or nav_mc_pos_z_p)"))
     elif osc > 50:
         score -= 15
-        findings.append(("INFO", f"Altitude oscillation: {osc:.0f}cm peak-to-peak "
+        findings.append(("INFO", f"Altitude oscillation: {osc:.0f}cm p1-p99 "
                          "(acceptable, <50cm is ideal)"))
+
+    # An isolated excursion is worth mentioning but is not oscillation, and
+    # quoting it beside the figure the verdict rests on reads as if it were.
+    if osc > 0 and osc_max > 3 * osc:
+        findings.append(("INFO", f"Largest single altitude excursion {osc_max:.0f}cm — "
+                         f"isolated, not sustained oscillation (p1-p99 is {osc:.0f}cm)"))
 
     # ─── Z velocity noise ───
     if "nav_vel_u" in data:
@@ -6348,7 +6396,7 @@ def run_nav_analysis(data, sr, config=None):
 
     if nav_phases and avail["has_pos"] and avail["has_tgt"]:
         best_alt = max(nav_phases, key=lambda p: p[1] - p[0])
-        results["althold"] = analyze_altitude_hold(data, sr, best_alt[0], best_alt[1])
+        results["althold"] = analyze_altitude_hold(data, sr, best_alt[0], best_alt[1], config=config)
         if held:
             # Every held segment, not just the longest. Reporting only the longest
             # hid a real spread: one log's segments measured CEP 31.9, 98.2, 181.1
