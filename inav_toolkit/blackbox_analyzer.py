@@ -3928,6 +3928,78 @@ ACC_1G_DEFAULT = 2048.0
 # smoothed at 2 Hz, vector-summed across axes).
 VIBRATION_MIN_HZ = 5.0
 VIBRATION_HF_HZ = 50.0
+# A sub-50Hz peak is called structural only if it survives in calm flight. Energy
+# at least this many times higher while manoeuvring is read as manoeuvre loading.
+VIB_MANOEUVRE_RATIO = 10.0
+# Calm flight needed before the comparison is attempted at all.
+VIB_CALM_MIN_S = 8.0
+# Below this total gyro rate the craft counts as calm, unless the flight's own
+# 40th percentile is higher (a log with no calm stretch must not define one).
+VIB_CALM_DPS = 60.0
+
+
+def _band_energy_per_sample(seg, sr, f_lo, f_hi):
+    """Mean power in [f_lo, f_hi] for one contiguous stretch, or None if too short.
+
+    Per-sample so that runs of different length compare directly."""
+    seg = np.asarray(seg, dtype=float)
+    seg = seg[np.isfinite(seg)]
+    n = len(seg)
+    if n < int(sr * 2):
+        return None
+    w = np.hanning(n)
+    spec = np.abs(np.fft.rfft((seg - seg.mean()) * w)) ** 2
+    freqs = np.fft.rfftfreq(n, 1.0 / sr)
+    band = (freqs >= f_lo) & (freqs <= f_hi)
+    if not np.any(band):
+        return None
+    return float(spec[band].sum() / n)
+
+
+def _low_freq_peak_source(raw, sr, freq_hz, gyro_mag):
+    """Is a sub-50Hz accel peak structural, or just the craft being thrown around?
+
+    A loose mount, flexing frame or failing bearing is a mechanical property: it
+    is there whenever the props turn, hover included. Manoeuvre loading only
+    appears while the sticks are moving. Sub-5Hz is already excluded from peak
+    detection, but aggressive Acro puts energy just above that line -- on LOG00009
+    the 4-8Hz band carried 90x more energy in Acro than in any stabilised mode, and
+    the resulting 6Hz peak was reported as "loose mounting, frame flex, or a
+    failing bearing" on a frame whose vibration score was 100/100.
+
+    Returns "structural", "manoeuvre", or None when there is not enough calm
+    flight to tell. Energies are computed per contiguous run and pooled by median:
+    an FFT across a boolean-masked concatenation reads every join as signal.
+    """
+    if gyro_mag is None:
+        return None
+    raw = np.asarray(raw, dtype=float)
+    gyro_mag = np.asarray(gyro_mag, dtype=float)
+    if len(gyro_mag) != len(raw):
+        return None
+
+    finite = np.isfinite(raw) & np.isfinite(gyro_mag)
+    if not np.any(finite):
+        return None
+    thresh = max(VIB_CALM_DPS, float(np.nanpercentile(gyro_mag[finite], 40)))
+    calm = finite & (gyro_mag < thresh)
+    busy = finite & ~calm
+
+    calm_runs = contiguous_runs(calm, sr, VIB_CALM_MIN_S)
+    busy_runs = contiguous_runs(busy, sr, 2.0)
+    if not calm_runs or not busy_runs:
+        return None
+
+    lo, hi = freq_hz * 0.7, freq_hz * 1.4
+    calm_e = [e for e in (_band_energy_per_sample(raw[a:b], sr, lo, hi) for a, b in calm_runs) if e]
+    busy_e = [e for e in (_band_energy_per_sample(raw[a:b], sr, lo, hi) for a, b in busy_runs) if e]
+    if not calm_e or not busy_e:
+        return None
+
+    calm_med, busy_med = float(np.median(calm_e)), float(np.median(busy_e))
+    if calm_med <= 0:
+        return "manoeuvre"
+    return "manoeuvre" if busy_med / calm_med >= VIB_MANOEUVRE_RATIO else "structural"
 
 # accSmooth is logged AFTER acc_lpf_hz and the optional notch, while INAV computes
 # accVib from the UNFILTERED signal (acceleration.c:607, before the soft LPF at
@@ -4007,6 +4079,14 @@ def analyze_accel_vibration(data, sr, prop_harmonics=None):
         results["acc_lpf_unknown"] = False
     results["band_limited"] = band_limited
 
+    # Total gyro rate, used to tell a mechanical fault from manoeuvre loading.
+    _gy = []
+    for _k in ("gyro_roll", "gyro_pitch", "gyro_yaw"):
+        _v = data.get(_k)
+        if _v is not None:
+            _gy.append(np.asarray(_v, dtype=float))
+    gyro_mag = np.sqrt(np.sum(np.square(np.vstack(_gy)), axis=0)) if _gy else None
+
     for axis_name, key in _ACCEL_AXIS_MAP.items():
         raw = data[key]
         clean = raw[~np.isnan(raw)]
@@ -4065,13 +4145,32 @@ def analyze_accel_vibration(data, sr, prop_harmonics=None):
                     "source": "prop_harmonic",
                 })
             elif freq < 50:
-                axis_findings.append({
-                    "level": "WARNING",
-                    "text": f"{axis_name}: Low-frequency vibration at {freq:.0f}Hz ({power:.0f}dB)",
-                    "detail": "Sub-50Hz accel vibration suggests loose mounting, "
-                              "frame flex, or a failing bearing.",
-                    "source": "structural_low",
-                })
+                # Only structural if it survives in calm flight -- see
+                # _low_freq_peak_source(). Manoeuvre loading is not a fault and
+                # must not read as one; the old wording sent a pilot looking for
+                # a failing bearing on a frame scoring 100/100.
+                origin = _low_freq_peak_source(raw, sr, freq, gyro_mag)
+                if origin == "manoeuvre":
+                    axis_findings.append({
+                        "level": "INFO",
+                        "text": f"{axis_name}: Low-frequency loading at {freq:.0f}Hz ({power:.0f}dB) while manoeuvring",
+                        "detail": "Present when the sticks are moving and absent in calm "
+                                  "flight, so this is the airframe responding to inputs, "
+                                  "not a mechanical fault. Nothing to fix.",
+                        "source": "manoeuvre_low",
+                    })
+                else:
+                    detail = ("Sub-50Hz accel vibration suggests loose mounting, "
+                              "frame flex, or a failing bearing.")
+                    if origin is None:
+                        detail += (" Note: too little calm flight in this log to separate "
+                                   "this from manoeuvre loading -- confirm on a hover.")
+                    axis_findings.append({
+                        "level": "WARNING",
+                        "text": f"{axis_name}: Low-frequency vibration at {freq:.0f}Hz ({power:.0f}dB)",
+                        "detail": detail,
+                        "source": "structural_low",
+                    })
             elif 50 <= freq <= 200:
                 axis_findings.append({
                     "level": "INFO",
@@ -4197,10 +4296,15 @@ def analyze_accel_vibration(data, sr, prop_harmonics=None):
                           f"Swap props between {worse_axis}-axis motors to isolate.",
             })
 
-    # Aggregate axis findings into top-level
+    # Aggregate axis findings into top-level. Warnings always; of the INFO
+    # findings only the manoeuvre reclassification, because that one replaces a
+    # warning -- without it the axis still reports a peak that nothing explains,
+    # which invites exactly the hardware hunt the reclassification exists to
+    # prevent. The remaining INFO findings (prop harmonics) would repeat on every
+    # axis and are left to the per-axis detail.
     for ax in results["axes"]:
         for f in ax["findings"]:
-            if f["level"] == "WARNING":
+            if f["level"] == "WARNING" or f.get("source") == "manoeuvre_low":
                 results["findings"].append(f)
 
     results["score"] = max(0, score)

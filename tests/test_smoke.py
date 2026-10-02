@@ -2710,3 +2710,63 @@ class TestPidAdviceNeedsEvidence:
                    for i in mild["info"]), mild["info"]
         loud = plan(9.0, "moderate")
         assert loud["actions"], "a moderate oscillation must still act"
+
+
+class TestLowFreqPeakSource:
+    """Separating a mechanical fault from manoeuvre loading.
+
+    A loose mount or failing bearing is there whenever the props turn. Manoeuvre
+    loading only appears while the sticks move. The detector used to call any
+    sub-50Hz peak structural, which labelled a 6Hz Acro artefact as "loose
+    mounting, frame flex, or a failing bearing" on a frame scoring 100/100.
+    """
+
+    @staticmethod
+    def _flight(sr=1000.0, dur=120.0):
+        """Calm first half, manoeuvring second half."""
+        import numpy as np
+        t = np.arange(0, dur, 1.0 / sr)
+        gyro = np.where(t < dur / 2, 5.0, 400.0)
+        rng = np.random.default_rng(0)
+        acc = rng.normal(0, 0.01, len(t))
+        return t, gyro, acc
+
+    def test_manoeuvre_loading_is_not_structural(self):
+        import numpy as np
+        from inav_toolkit.blackbox_analyzer import _low_freq_peak_source
+        t, gyro, acc = self._flight()
+        busy = gyro > 100
+        acc = acc + 0.2 * np.sin(2 * np.pi * 6.0 * t) * busy
+        assert _low_freq_peak_source(acc, 1000.0, 6.0, gyro) == "manoeuvre"
+
+    def test_constant_vibration_is_structural(self):
+        import numpy as np
+        from inav_toolkit.blackbox_analyzer import _low_freq_peak_source
+        t, gyro, acc = self._flight()
+        acc = acc + 0.2 * np.sin(2 * np.pi * 6.0 * t)      # present throughout
+        assert _low_freq_peak_source(acc, 1000.0, 6.0, gyro) == "structural"
+
+    def test_structural_wins_even_with_manoeuvre_loading_on_top(self):
+        """A real fault must still be caught on a log that also has Acro in it."""
+        import numpy as np
+        from inav_toolkit.blackbox_analyzer import _low_freq_peak_source
+        t, gyro, acc = self._flight()
+        busy = gyro > 100
+        acc = acc + 0.2 * np.sin(2 * np.pi * 6.0 * t) \
+                  + 0.4 * np.sin(2 * np.pi * 6.0 * t + 1.0) * busy
+        assert _low_freq_peak_source(acc, 1000.0, 6.0, gyro) == "structural"
+
+    def test_declines_without_calm_flight(self):
+        """No calm stretch: say so rather than guess either way."""
+        import numpy as np
+        from inav_toolkit.blackbox_analyzer import _low_freq_peak_source
+        t = np.arange(0, 60, 0.001)
+        gyro = np.full(len(t), 400.0)
+        acc = np.sin(2 * np.pi * 6.0 * t)
+        assert _low_freq_peak_source(acc, 1000.0, 6.0, gyro) is None
+
+    def test_declines_on_mismatched_lengths(self):
+        import numpy as np
+        from inav_toolkit.blackbox_analyzer import _low_freq_peak_source
+        assert _low_freq_peak_source(np.zeros(100), 1000.0, 6.0, np.zeros(50)) is None
+        assert _low_freq_peak_source(np.zeros(100), 1000.0, 6.0, None) is None
