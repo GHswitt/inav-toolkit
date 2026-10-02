@@ -5934,11 +5934,33 @@ def analyze_nav_performance(data, sr, config=None, profile=None):
                     deadband = float(config.get("alt_hold_deadband", deadband) or deadband)
                 except (TypeError, ValueError):
                     pass
-            ah_thr = np.asarray(thr, dtype=float)[althold_mask]
-            # STICK mode zeroes on the throttle at engagement, so the reference is
-            # per-segment rather than a fixed mid-stick value.
-            ref = float(np.nanmedian(ah_thr)) if len(ah_thr) else 0.0
-            held = np.abs(ah_thr - ref) <= deadband
+            # STICK mode zeroes on the throttle at engagement (altHoldThrottleRCZero,
+            # navigation_multicopter.c), so the reference belongs to each engagement.
+            # This used to take one nanmedian across every AltHold sample in the
+            # flight, which is wrong whenever hover throttle drifts between
+            # engagements -- and it does, with battery state. On LOG00008 the
+            # per-segment references span 147us against a 30us deadband, with one
+            # 82-second segment sitting 95us off the global median, so that whole
+            # segment was classified wrongly. It made the metric incomparable
+            # between flights: the same flight scored 113cm or 46cm depending only
+            # on how far its segments happened to sit from their pooled median.
+            thr_full = np.asarray(thr, dtype=float)
+            held_full = np.zeros(len(althold_mask), dtype=bool)
+            idx = np.flatnonzero(althold_mask)
+            if idx.size:
+                splits = np.flatnonzero(np.diff(idx) > 1)
+                starts = np.concatenate(([0], splits + 1))
+                ends = np.concatenate((splits + 1, [idx.size]))
+                settle = max(1, int(round(0.5 * sr)))
+                for _s, _e in zip(starts, ends):
+                    seg = idx[_s:_e]
+                    if seg.size < settle:
+                        continue
+                    ref = float(np.nanmedian(thr_full[seg[:settle]]))
+                    if not np.isfinite(ref):
+                        continue
+                    held_full[seg] = np.abs(thr_full[seg] - ref) <= deadband
+            held = held_full[althold_mask]
             if np.count_nonzero(valid & held) > sr * 2:
                 valid = valid & held
                 results["althold_stick_filtered"] = True
