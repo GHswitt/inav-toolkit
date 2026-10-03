@@ -1611,7 +1611,16 @@ class BlackboxDecoder:
                     values = self._apply_i_predictors(raw)
                     if self._validate_i_frame(values):
                         all_frames.append(values)
-                        prev_prev, prev = prev, values
+                        # An I-frame collapses BOTH history slots onto itself --
+                        # blackbox.c:1048-1050, "since we have no other history,
+                        # we also use it for the before-before state". Rotating
+                        # normally here leaves prev_prev pointing at the last
+                        # P-frame, so every STRAIGHT_LINE and AVERAGE_2 predictor
+                        # in the first P-frame after an I-frame extrapolates from
+                        # the wrong baseline. On LOG00010 that put `time` one
+                        # frame interval ahead at each I-frame and made it
+                        # non-monotonic.
+                        prev_prev = prev = values
                         self.stats['i_frames'] += 1
                         consec_errors = 0
                     else:
