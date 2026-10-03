@@ -1251,19 +1251,37 @@ class BlackboxDecoder:
                 values[i] = self._read_signed_vb(); i += 1
         return values
 
+    @staticmethod
+    def _wrap32(v):
+        """Reduce to int32 the way the firmware's arithmetic does.
+
+        Fields like motor[] are declared *unsigned* but carry a value predicted
+        against minthrottle, so the firmware writes motor-minthrottle as an
+        unsigned VB. When the motor sits below minthrottle -- disarmed, motors
+        stopped, which is every bench log -- that difference is negative and goes
+        out as a large unsigned. C adds minthrottle back in int32 and wraps to the
+        right answer; Python's unbounded ints do not, leaving motor[0] at
+        4294968296 instead of 1000. The I-frame validator then rejected the frame
+        as out of range, and on LOG00010 that discarded 1899 of 1928 I-frames
+        (98.5%), after which P-frame prediction drifted into 64% "impossible
+        samples". The file was fine; orangebox read it cleanly.
+        """
+        v &= 0xFFFFFFFF
+        return v - 0x100000000 if v >= 0x80000000 else v
+
     def _apply_i_predictors(self, raw):
         values = list(raw)
         for i in range(self.i_def['count']):
             pred = self.i_def['predictor'][i]
             if pred == self.PRED_MINTHROTTLE:
-                values[i] = raw[i] + self.minthrottle
+                values[i] = self._wrap32(raw[i] + self.minthrottle)
             elif pred == self.PRED_MOTOR_0:
                 if self._motor0_idx is not None and self._motor0_idx < i:
-                    values[i] = raw[i] + values[self._motor0_idx]
+                    values[i] = self._wrap32(raw[i] + values[self._motor0_idx])
             elif pred == self.PRED_VBATREF:
-                values[i] = raw[i] + self.vbatref
+                values[i] = self._wrap32(raw[i] + self.vbatref)
             elif pred == self.PRED_1500:
-                values[i] = raw[i] + 1500
+                values[i] = self._wrap32(raw[i] + 1500)
         return values
 
     def _apply_p_predictors(self, raw, prev, prev_prev):

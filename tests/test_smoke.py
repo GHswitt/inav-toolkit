@@ -2770,3 +2770,35 @@ class TestLowFreqPeakSource:
         from inav_toolkit.blackbox_analyzer import _low_freq_peak_source
         assert _low_freq_peak_source(np.zeros(100), 1000.0, 6.0, np.zeros(50)) is None
         assert _low_freq_peak_source(np.zeros(100), 1000.0, 6.0, None) is None
+
+
+class TestInt32PredictorWrap:
+    """Fields predicted against minthrottle go negative when motors are stopped.
+
+    motor[] is declared unsigned but carries motor-minthrottle. Disarmed on the
+    bench the motor sits below minthrottle, so that difference is negative and is
+    written as a large unsigned. C adds minthrottle back in int32 and wraps;
+    Python's unbounded ints do not. Unwrapped, motor[0] read 4294968296 instead
+    of 1000, the I-frame validator rejected the frame as out of range, and
+    LOG00010 lost 1899 of its 1928 I-frames.
+    """
+
+    def test_wrap_negative_difference(self):
+        from inav_toolkit.blackbox_analyzer import BlackboxDecoder
+        # motor 1000 with minthrottle 1050 -> firmware wrote (1000-1050) = -50
+        # as unsigned 32-bit
+        raw_unsigned = (-50) & 0xFFFFFFFF
+        assert BlackboxDecoder._wrap32(raw_unsigned + 1050) == 1000
+
+    def test_wrap_leaves_normal_values_alone(self):
+        from inav_toolkit.blackbox_analyzer import BlackboxDecoder
+        for v in (0, 1, 1000, 1050, 2000, 0x7FFFFFFF):
+            assert BlackboxDecoder._wrap32(v) == v
+
+    def test_wrap_is_symmetric_about_int32(self):
+        from inav_toolkit.blackbox_analyzer import BlackboxDecoder
+        w = BlackboxDecoder._wrap32
+        assert w(0x80000000) == -2147483648
+        assert w(0xFFFFFFFF) == -1
+        assert w(0x100000000) == 0          # full wrap
+        assert w(0x100000000 + 1000) == 1000
