@@ -5353,6 +5353,40 @@ POSHOLD_SETTLE_S = 2.0
 # INAV's pos_hold_deadband default, in r/c points. Outside it the sticks are
 # repositioning the hold point, not holding it.
 POSHOLD_STICK_DEADBAND = 10.0
+
+
+def poshold_sticks_centred(data, sr, config=None):
+    """Full-length bool: roll/pitch sticks inside pos_hold_deadband, settle excluded.
+
+    While the sticks are deflected the pilot is repositioning: navTgtPos stays
+    frozen at the old hold point and re-latches when they centre, so "error" is
+    distance travelled rather than drift. Every metric built on position-vs-target
+    during PosHold needs this, and the file has grown several independent copies
+    of the same computation -- use this one rather than adding another.
+
+    Returns None when the sticks are not in the log, so callers can fall back.
+    """
+    rr, rp = data.get("rc_roll"), data.get("rc_pitch")
+    if rr is None or rp is None:
+        return None
+    deadband = POSHOLD_STICK_DEADBAND
+    if config:
+        try:
+            deadband = float(config.get("pos_hold_deadband", deadband) or deadband)
+        except (TypeError, ValueError):
+            pass
+    rr = np.asarray(rr, dtype=float)
+    rp = np.asarray(rp, dtype=float)
+    # rcData centres on 1500. INAV deadbands rcCommand, which expo shrinks near
+    # centre, so testing the raw stick excludes slightly more than the firmware
+    # would -- erring wide is right for a hold metric.
+    moving = (np.abs(rr - 1500.0) > deadband) | (np.abs(rp - 1500.0) > deadband)
+    moving = np.where(np.isfinite(moving), moving, False)
+    held = ~moving
+    settle = int(POSHOLD_SETTLE_S * sr)
+    for i in np.flatnonzero(np.diff(moving.astype(np.int8)) == -1):
+        held[i:i + settle] = False
+    return held
 POSHOLD_TARGET_STEP_CM = 500.0
 
 # A toilet bowl has to actually go round. Thresholds for calling one:
@@ -5751,13 +5785,30 @@ def analyze_estimator_health(data, sr):
     ba_norm = ba - ba[0]
     divergence = np.abs(nz_norm - ba_norm)
     max_div = float(np.max(divergence))
+    # A single sample must not define this. Judge on how long the divergence was
+    # actually sustained, and report the median beside the extreme: on LOG00007
+    # the 3098cm peak held above 10 m for 56 s (13% of the flight) with a median
+    # of 546cm, which is a real estimator fault -- while a log whose peak is a
+    # lone GPS or baro sample would show seconds of nothing.
+    p50_div = float(np.percentile(divergence, 50))
+    p99_div = float(np.percentile(divergence, 99))
+    secs_above = float(np.sum(divergence > 1000)) / sr
     results["max_divergence_cm"] = round(max_div, 1)
+    results["median_divergence_cm"] = round(p50_div, 1)
+    results["p99_divergence_cm"] = round(p99_div, 1)
+    results["divergence_seconds_above_10m"] = round(secs_above, 1)
 
-    if max_div > 1000:  # >10m divergence
+    if max_div > 1000 and secs_above >= 1.0:
         score -= 30
         findings.append(("WARNING",
-                         f"Estimator diverged {max_div:.0f}cm from baro - "
-                         "IMU/accel issue or baro failure"))
+                         f"Estimator diverged from baro for {secs_above:.0f}s "
+                         f"(median {p50_div:.0f}cm, p99 {p99_div:.0f}cm, peak "
+                         f"{max_div:.0f}cm) - IMU/accel issue or baro failure"))
+    elif max_div > 1000:
+        findings.append(("INFO",
+                         f"Estimator-baro divergence peaked at {max_div:.0f}cm but held "
+                         f"above 10 m for only {secs_above:.1f}s (median {p50_div:.0f}cm) "
+                         "- an isolated sample, not a sustained fault"))
 
     results["score"] = max(0, score)
     results["findings"] = findings
@@ -6307,7 +6358,17 @@ def analyze_nav_performance(data, sr, config=None, profile=None):
             tgt_e = data["nav_tgt_e"].copy()
 
             # Simple: correlate wind speed with position error magnitude during poshold
-            ph_indices = np.where(poshold_mask)[0]
+            # Same filter as the hold metrics above: in wind the pilot works the
+            # sticks more, which inflates the unfiltered error, which manufactures
+            # the very correlation this block tests for -- and it stages a
+            # nav_mc_vel_xy_i change off the back of it. Measured on LOG00009:
+            # stick deflection correlates +0.42 with the unfiltered error, and
+            # mean error falls 49 -> 29 cm once repositioning is excluded.
+            _centred = poshold_sticks_centred(data, sr, config)
+            _ph_mask = poshold_mask & _centred if _centred is not None else poshold_mask
+            if np.sum(_ph_mask) < sr * 2:
+                _ph_mask = poshold_mask
+            ph_indices = np.where(_ph_mask)[0]
             if len(ph_indices) > sr * 2:
                 err_n = pos_n[ph_indices] - tgt_n[ph_indices]
                 err_e = pos_e[ph_indices] - tgt_e[ph_indices]
