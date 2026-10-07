@@ -1793,6 +1793,13 @@ class BlackboxDecoder:
             "att_roll": ["attitude[0]"], "att_pitch": ["attitude[1]"], "att_heading": ["attitude[2]"],
             "baro_alt": ["BaroAlt"],
             "acc_x": ["accSmooth[0]"], "acc_y": ["accSmooth[1]"], "acc_z": ["accSmooth[2]"],
+            # Raw magnetometer. INAV logs magADC[] when the MAG blackbox feature is
+            # on (`blackbox MAG`), and it is the only way to see what the sensor is
+            # actually doing rather than inferring it from the fused heading --
+            # field magnitude for calibration quality, per-sample jumps for I2C
+            # corruption, drift while stationary. Nothing mapped it, so a log that
+            # carried the data decoded without it and the fields were silently lost.
+            "mag_x": ["magADC[0]"], "mag_y": ["magADC[1]"], "mag_z": ["magADC[2]"],
             # INAV computes its own vibration level (accGetVibrationLevel() * acc_1G,
             # blackbox.c:1672) and logs it. Nothing here read it, so the analyzer
             # recomputed a worse figure from raw accel instead.
@@ -2032,6 +2039,7 @@ def parse_csv_log(csv_path):
         "att_roll": ["attitude[0]"], "att_pitch": ["attitude[1]"], "att_heading": ["attitude[2]"],
         "baro_alt": ["baroalt"],
         "acc_x": ["accsmooth[0]"], "acc_y": ["accsmooth[1]"], "acc_z": ["accsmooth[2]"],
+        "mag_x": ["magadc[0]"], "mag_y": ["magadc[1]"], "mag_z": ["magadc[2]"],
         "throttle": ["rccommand[3]"],
         "rc_roll": ["rcdata[0]"], "rc_pitch": ["rcdata[1]"],
         "rc_yaw": ["rcdata[2]"], "rc_throttle": ["rcdata[3]"],
